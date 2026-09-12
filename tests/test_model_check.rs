@@ -90,6 +90,44 @@ fn test_detect_internal_cavities_ignores_volume_connected_to_outside() {
 }
 
 #[test]
+fn test_detect_internal_cavities_treats_empty_box_as_an_enclosed_cutout() {
+    let script = "p 0 0 0 3 3 3 Material\ne 1 1 1 2 2 2";
+
+    let result = detect_internal_cavities(script, 1_000_000);
+
+    assert_eq!(result.cavities.len(), 1);
+    assert_eq!(result.cavities[0].bounds, [1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+}
+
+#[test]
+fn test_detect_internal_cavities_treats_exterior_connected_cutout_as_open() {
+    let script = "p 0 0 0 3 3 3 Material\ne 0 1 1 2 2 2";
+
+    let result = detect_internal_cavities(script, 1_000_000);
+
+    assert!(result.cavities.is_empty());
+}
+
+#[test]
+fn test_detect_internal_cavities_does_not_fill_cutout_with_bc_box() {
+    let script = "p 0 0 0 3 3 3 Material\ne 1 1 1 2 2 2\nb 1 1 1 2 2 2 2";
+
+    let result = detect_internal_cavities(script, 1_000_000);
+
+    assert_eq!(result.cavities.len(), 1);
+    assert_eq!(result.cavities[0].bounds, [1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+}
+
+#[test]
+fn test_detect_internal_cavities_applies_material_and_empty_boxes_in_script_order() {
+    let script = "p 0 0 0 3 3 3 Material\ne 1 1 1 2 2 2\np 1 1 1 2 2 2 Material";
+
+    let result = detect_internal_cavities(script, 1_000_000);
+
+    assert!(result.cavities.is_empty());
+}
+
+#[test]
 fn test_detect_internal_cavities_skips_large_grid() {
     let result = detect_internal_cavities(&unit_cube_shell_script(false), 10);
     assert!(result.skipped);

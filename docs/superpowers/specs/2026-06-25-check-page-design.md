@@ -44,13 +44,18 @@ The page contains:
 
 ## Internal Cavity Check
 
-The checker uses the same valid 3D objects: `p`, `b`, and `e`.
+The checker uses coordinates from valid `p`, `b`, and `e` objects to construct
+the grid. Its material occupancy follows HEAT3 script semantics: `p` fills a
+material volume, `e` cuts material out, and `b` contributes boundary surfaces
+without filling volume. Overlapping `p`/`e` operations are applied in script
+order, so the last object at a cell prevails.
 
 Algorithm:
 
 1. Build sorted unique X, Y, and Z plane coordinates from all positive-volume boxes.
 2. Treat the space between adjacent planes as a discrete 3D cell grid.
-3. Mark cells covered by any box as occupied.
+3. Apply `p` and `e` operations in script order to mark material and empty
+   cells; do not mark `b` boxes as occupied.
 4. Flood-fill empty cells connected to the outer boundary of the model bounding grid.
 5. Any remaining empty cells are internal cavities.
 
