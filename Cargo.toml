@@ -1,0 +1,43 @@
+[package]
+name = "heat3_povorotnik"
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.88"
+description = "HEAT3 Поворотник — утилита поворота/отражения/перестановки осей скриптов HEAT3"
+default-run = "heat3_povorotnik"
+
+[dependencies]
+iced = { version = "0.14", features = ["wgpu", "canvas"] }
+arboard = "3.4.0"
+aes-gcm = { version = "0.11.0", features = ["zeroize"] }
+base64 = "0.22.1"
+ed25519-dalek = "3.0.0"
+regex = "1.10.6"
+chrono = "0.4.38"
+encoding_rs = "0.8.34"
+rfd = "0.15.0"
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+httpdate = "1.0.3"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+fs2 = "0.4.3"
+zeroize = { version = "1.9.0", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

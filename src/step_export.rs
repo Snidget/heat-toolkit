@@ -1,0 +1,546 @@
+//! Экспорт модели (набора параллелепипедов) в формат STEP (ISO 10303-21).
+//!
+//! Формирует корректный текстовый STEP-файл без внешних зависимостей.
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+
+fn fmt_r(value: f64) -> String {
+    crate::text::format_real(value)
+}
+
+fn step_ref(n: usize) -> String {
+    format!("#{}", n)
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn norm(v: [f64; 3]) -> f64 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
+fn loop_normal(loop_pts: &[[f64; 3]]) -> [f64; 3] {
+    let mut sx = 0.0;
+    let mut sy = 0.0;
+    let mut sz = 0.0;
+    let count = loop_pts.len();
+    for i in 0..count {
+        let p = loop_pts[i];
+        let q = loop_pts[(i + 1) % count];
+        sx += p[1] * q[2] - p[2] * q[1];
+        sy += p[2] * q[0] - p[0] * q[2];
+        sz += p[0] * q[1] - p[1] * q[0];
+    }
+    [sx, sy, sz]
+}
+
+fn ccw_order_indices(corners: &[[f64; 3]], indices: &[usize], normal: [f64; 3]) -> Vec<usize> {
+    let centroid: [f64; 3] = {
+        let mut c = [0.0, 0.0, 0.0];
+        for &i in indices {
+            for axis in 0..3 {
+                c[axis] += corners[i][axis];
+            }
+        }
+        let n = indices.len() as f64;
+        [c[0] / n, c[1] / n, c[2] / n]
+    };
+    let mut u = [0.0, 0.0, 0.0];
+    for (axis, value) in u.iter_mut().enumerate() {
+        *value = corners[indices[0]][axis] - centroid[axis];
+    }
+    let u_len = norm(u);
+    if u_len < 1e-9 {
+        return indices.to_vec();
+    }
+    for value in &mut u {
+        *value /= u_len;
+    }
+    let v = cross(normal, u);
+    let v_len = norm(v);
+    if v_len < 1e-9 {
+        return indices.to_vec();
+    }
+    let v = [v[0] / v_len, v[1] / v_len, v[2] / v_len];
+
+    let mut order: Vec<usize> = indices.to_vec();
+    order.sort_by(|&a, &b| {
+        let da = [
+            corners[a][0] - centroid[0],
+            corners[a][1] - centroid[1],
+            corners[a][2] - centroid[2],
+        ];
+        let db = [
+            corners[b][0] - centroid[0],
+            corners[b][1] - centroid[1],
+            corners[b][2] - centroid[2],
+        ];
+        let xa = da[0] * u[0] + da[1] * u[1] + da[2] * u[2];
+        let ya = da[0] * v[0] + da[1] * v[1] + da[2] * v[2];
+        let xb = db[0] * u[0] + db[1] * u[1] + db[2] * u[2];
+        let yb = db[0] * v[0] + db[1] * v[1] + db[2] * v[2];
+        ya.atan2(xa).partial_cmp(&yb.atan2(xb)).unwrap()
+    });
+    order
+}
+
+struct StepWriter {
+    lines: Vec<String>,
+    counter: usize,
+    direction_cache: HashMap<(i64, i64, i64), usize>,
+}
+
+impl StepWriter {
+    fn new() -> Self {
+        StepWriter {
+            lines: Vec::new(),
+            counter: 0,
+            direction_cache: HashMap::new(),
+        }
+    }
+
+    fn nid(&mut self) -> usize {
+        self.counter += 1;
+        self.counter
+    }
+
+    fn add(&mut self, body: &str) -> usize {
+        let index = self.nid();
+        self.lines.push(format!("{} = {};", step_ref(index), body));
+        index
+    }
+
+    fn direction(&mut self, xyz: [f64; 3]) -> usize {
+        let key = (
+            (xyz[0] * 1e9).round() as i64,
+            (xyz[1] * 1e9).round() as i64,
+            (xyz[2] * 1e9).round() as i64,
+        );
+        if let Some(&id) = self.direction_cache.get(&key) {
+            return id;
+        }
+        let id = self.add(&format!(
+            "DIRECTION('',({},{},{}))",
+            fmt_r(xyz[0]),
+            fmt_r(xyz[1]),
+            fmt_r(xyz[2])
+        ));
+        self.direction_cache.insert(key, id);
+        id
+    }
+}
+
+fn add_box(writer: &mut StepWriter, box_: [f64; 6], xdir: usize, ydir: usize) -> usize {
+    let x0 = box_[0].min(box_[3]);
+    let x1 = box_[0].max(box_[3]);
+    let y0 = box_[1].min(box_[4]);
+    let y1 = box_[1].max(box_[4]);
+    let z0 = box_[2].min(box_[5]);
+    let z1 = box_[2].max(box_[5]);
+
+    let corners: [[f64; 3]; 8] = [
+        [x0, y0, z0],
+        [x1, y0, z0],
+        [x1, y1, z0],
+        [x0, y1, z0],
+        [x0, y0, z1],
+        [x1, y0, z1],
+        [x1, y1, z1],
+        [x0, y1, z1],
+    ];
+
+    let points: Vec<usize> = corners
+        .iter()
+        .map(|c| {
+            writer.add(&format!(
+                "CARTESIAN_POINT('',({},{},{}))",
+                fmt_r(c[0]),
+                fmt_r(c[1]),
+                fmt_r(c[2])
+            ))
+        })
+        .collect();
+    let vertices: Vec<usize> = points
+        .iter()
+        .map(|&p| writer.add(&format!("VERTEX_POINT('',{})", step_ref(p))))
+        .collect();
+
+    let edge_defs: [(usize, usize); 12] = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+    let mut edge_ids: HashMap<(usize, usize), usize> = HashMap::new();
+    for &(a, b) in &edge_defs {
+        let dx = corners[b][0] - corners[a][0];
+        let dy = corners[b][1] - corners[a][1];
+        let dz = corners[b][2] - corners[a][2];
+        let length = (dx * dx + dy * dy + dz * dz).sqrt();
+        let axis = [dx / length, dy / length, dz / length];
+        let axis_id = writer.direction(axis);
+        let vector = writer.add(&format!(
+            "VECTOR('',{}, {})",
+            step_ref(axis_id),
+            fmt_r(length)
+        ));
+        let line = writer.add(&format!(
+            "LINE('',{},{})",
+            step_ref(points[a]),
+            step_ref(vector)
+        ));
+        let edge_curve = writer.add(&format!(
+            "EDGE_CURVE('',{},{},{},.T.)",
+            step_ref(vertices[a]),
+            step_ref(vertices[b]),
+            step_ref(line)
+        ));
+        edge_ids.insert((a, b), edge_curve);
+    }
+
+    let faces: [([usize; 4], [f64; 3]); 6] = [
+        ([1, 5, 6, 2], [1.0, 0.0, 0.0]),
+        ([0, 3, 7, 4], [-1.0, 0.0, 0.0]),
+        ([3, 2, 6, 7], [0.0, 1.0, 0.0]),
+        ([0, 4, 5, 1], [0.0, -1.0, 0.0]),
+        ([4, 5, 6, 7], [0.0, 0.0, 1.0]),
+        ([0, 3, 2, 1], [0.0, 0.0, -1.0]),
+    ];
+
+    let mut face_ids: Vec<usize> = Vec::new();
+    for (face_corners, normal) in &faces {
+        let ordered = ccw_order_indices(&corners, face_corners, *normal);
+        let loop_indices = ordered.clone();
+        let mut oriented_edges: Vec<usize> = Vec::new();
+        for i in 0..loop_indices.len() {
+            let u = loop_indices[i];
+            let v = loop_indices[(i + 1) % loop_indices.len()];
+            let (ec, orient) = if let Some(&id) = edge_ids.get(&(u, v)) {
+                (id, ".T.")
+            } else {
+                (*edge_ids.get(&(v, u)).unwrap(), ".F.")
+            };
+            oriented_edges.push(writer.add(&format!(
+                "ORIENTED_EDGE('',*,*,{},{})",
+                step_ref(ec),
+                orient
+            )));
+        }
+        let edge_loop = writer.add(&format!(
+            "EDGE_LOOP('',({}))",
+            oriented_edges
+                .iter()
+                .map(|o| step_ref(*o))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        let face_bound = writer.add(&format!("FACE_BOUND('',{},.T.)", step_ref(edge_loop)));
+        let ndir = writer.direction(*normal);
+        let xref = if normal[0].abs() > 0.5 { ydir } else { xdir };
+        let fx = corners[loop_indices[0]][0];
+        let fy = corners[loop_indices[0]][1];
+        let fz = corners[loop_indices[0]][2];
+        let face_pt = writer.add(&format!(
+            "CARTESIAN_POINT('',({},{},{}))",
+            fmt_r(fx),
+            fmt_r(fy),
+            fmt_r(fz)
+        ));
+        let face_axis = writer.add(&format!(
+            "AXIS2_PLACEMENT_3D('',{},{},{})",
+            step_ref(face_pt),
+            step_ref(ndir),
+            step_ref(xref)
+        ));
+        let plane = writer.add(&format!("PLANE('',{})", step_ref(face_axis)));
+        let loop_n = loop_normal(&loop_indices.iter().map(|&i| corners[i]).collect::<Vec<_>>());
+        let same_sense =
+            if loop_n[0] * normal[0] + loop_n[1] * normal[1] + loop_n[2] * normal[2] >= 0.0 {
+                ".T."
+            } else {
+                ".F."
+            };
+        let face = writer.add(&format!(
+            "ADVANCED_FACE('',({}),{},{})",
+            step_ref(face_bound),
+            step_ref(plane),
+            same_sense
+        ));
+        face_ids.push(face);
+    }
+
+    let closed_shell = writer.add(&format!(
+        "CLOSED_SHELL('',({}))",
+        face_ids
+            .iter()
+            .map(|f| step_ref(*f))
+            .collect::<Vec<_>>()
+            .join(",")
+    ));
+    writer.add(&format!(
+        "MANIFOLD_SOLID_BREP('',{})",
+        step_ref(closed_shell)
+    ))
+}
+
+pub fn write_step(path: &Path, boxes: &[[f64; 6]]) -> std::io::Result<()> {
+    let mut writer = StepWriter::new();
+
+    let ctx = writer.add("APPLICATION_CONTEXT('')");
+    let prod_ctx = writer.add(&format!(
+        "PRODUCT_CONTEXT('',{},'mechanical')",
+        step_ref(ctx)
+    ));
+    let product = writer.add(&format!(
+        "PRODUCT('PovorotnikModel','Exported boxes','',({}))",
+        step_ref(prod_ctx)
+    ));
+    let formation = writer.add(&format!(
+        "PRODUCT_DEFINITION_FORMATION('','',{})",
+        step_ref(product)
+    ));
+    let pdef_ctx = writer.add(&format!(
+        "PRODUCT_DEFINITION_CONTEXT('',{},'design')",
+        step_ref(ctx)
+    ));
+    let pdef = writer.add(&format!(
+        "PRODUCT_DEFINITION('','',{},{})",
+        step_ref(formation),
+        step_ref(pdef_ctx)
+    ));
+    let pdef_shape = writer.add(&format!(
+        "PRODUCT_DEFINITION_SHAPE('','',{})",
+        step_ref(pdef)
+    ));
+
+    let length_unit =
+        writer.add("( LENGTH_UNIT ( ) NAMED_UNIT ( * ) SI_UNIT ( .MILLI. , .METRE. ) )");
+    let plane_angle_unit =
+        writer.add("( NAMED_UNIT ( * ) PLANE_ANGLE_UNIT ( ) SI_UNIT ( $ , .RADIAN. ) )");
+    let solid_angle_unit =
+        writer.add("( NAMED_UNIT ( * ) SOLID_ANGLE_UNIT ( ) SI_UNIT ( $ , .STERADIAN. ) )");
+    let xdir = writer.direction([1.0, 0.0, 0.0]);
+    let ydir = writer.direction([0.0, 1.0, 0.0]);
+    let uncertainty = writer.add(&format!(
+        "UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-07),{},'','')",
+        step_ref(length_unit)
+    ));
+    let geom_ctx = writer.add(&format!(
+        "( GEOMETRIC_REPRESENTATION_CONTEXT ( 3 ) GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT ( ({}) ) GLOBAL_UNIT_ASSIGNED_CONTEXT ( ({},{},{}) ) REPRESENTATION_CONTEXT ( 'Context #1', '3D Context with UNIT and UNCERTAINTY' ) )",
+        step_ref(uncertainty),
+        step_ref(length_unit),
+        step_ref(plane_angle_unit),
+        step_ref(solid_angle_unit)
+    ));
+
+    let brep_ids: Vec<usize> = boxes
+        .iter()
+        .copied()
+        .filter(|b| {
+            let dx = (b[3] - b[0]).abs();
+            let dy = (b[4] - b[1]).abs();
+            let dz = (b[5] - b[2]).abs();
+            dx > 1e-9 && dy > 1e-9 && dz > 1e-9
+        })
+        .map(|b| add_box(&mut writer, b, xdir, ydir))
+        .collect();
+    let items = brep_ids
+        .iter()
+        .map(|i| step_ref(*i))
+        .collect::<Vec<_>>()
+        .join(",");
+    let shape_repr = writer.add(&format!(
+        "SHAPE_REPRESENTATION('',({}),{})",
+        items,
+        step_ref(geom_ctx)
+    ));
+    writer.add(&format!(
+        "SHAPE_DEFINITION_REPRESENTATION({},{})",
+        step_ref(pdef_shape),
+        step_ref(shape_repr)
+    ));
+
+    let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default()
+        .replace('\'', "''");
+    let header = [
+        "ISO-10303-21;",
+        "HEADER;",
+        "FILE_DESCRIPTION(('Povorotnik model export'),'2;1');",
+        &format!(
+            "FILE_NAME('{}','{}',(''),(''),'opencode','Povorotnik','');",
+            file_name, now
+        ),
+        "FILE_SCHEMA(('AUTOMOTIVE_DESIGN'));",
+        "ENDSEC;",
+        "DATA;",
+    ];
+    let footer = ["ENDSEC;", "END-ISO-10303-21;"];
+
+    let mut out = String::new();
+    out.push_str(&header.join("\n"));
+    out.push('\n');
+    out.push_str(&writer.lines.join("\n"));
+    out.push('\n');
+    out.push_str(&footer.join("\n"));
+    out.push('\n');
+
+    fs::write(path, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn entity_map(lines: &[String]) -> HashMap<String, String> {
+        lines
+            .iter()
+            .filter_map(|line| {
+                let (id, body) = line.split_once(" = ")?;
+                Some((
+                    id.trim().to_string(),
+                    body.trim_end_matches(';').trim().to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn advanced_face_keeps_surface_outside_bounds_list() {
+        let mut writer = StepWriter::new();
+        let xdir = writer.direction([1.0, 0.0, 0.0]);
+        let ydir = writer.direction([0.0, 1.0, 0.0]);
+
+        add_box(&mut writer, [0.0, 0.0, 0.0, 1.0, 2.0, 3.0], xdir, ydir);
+
+        let faces: Vec<&str> = writer
+            .lines
+            .iter()
+            .filter(|line| line.contains("ADVANCED_FACE"))
+            .map(String::as_str)
+            .collect();
+
+        assert_eq!(faces.len(), 6);
+        for face in faces {
+            let (_, arguments) = face
+                .split_once("ADVANCED_FACE('',(")
+                .expect("ADVANCED_FACE arguments");
+            let (bounds, surface_and_sense) =
+                arguments.split_once("),").expect("closed bounds list");
+
+            assert!(bounds.starts_with('#'), "missing face bound: {face}");
+            assert!(!bounds.contains(','), "surface leaked into bounds: {face}");
+            assert!(
+                surface_and_sense.starts_with('#'),
+                "surface must be a separate reference: {face}"
+            );
+        }
+    }
+
+    #[test]
+    fn lines_reference_cartesian_point_and_vector() {
+        let mut writer = StepWriter::new();
+        let xdir = writer.direction([1.0, 0.0, 0.0]);
+        let ydir = writer.direction([0.0, 1.0, 0.0]);
+
+        add_box(&mut writer, [0.0, 0.0, 0.0, 1.0, 2.0, 3.0], xdir, ydir);
+
+        let lines: Vec<&str> = writer
+            .lines
+            .iter()
+            .filter(|line| line.contains(" = LINE("))
+            .map(String::as_str)
+            .collect();
+        let vectors = writer
+            .lines
+            .iter()
+            .filter(|line| line.contains(" = VECTOR("))
+            .count();
+        let entities = entity_map(&writer.lines);
+
+        assert_eq!(lines.len(), 12);
+        assert_eq!(vectors, 12);
+        for line in lines {
+            let (_, arguments) = line
+                .split_once("LINE('',")
+                .expect("LINE should contain two references");
+            let parts = arguments
+                .trim_end_matches(");")
+                .split(',')
+                .collect::<Vec<_>>();
+            assert_eq!(parts.len(), 2, "unexpected LINE arguments: {line}");
+            assert!(
+                entities[parts[0]].starts_with("CARTESIAN_POINT("),
+                "LINE must start from CARTESIAN_POINT: {line}"
+            );
+            assert!(
+                entities[parts[1]].starts_with("VECTOR("),
+                "LINE must use VECTOR direction: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_step_skips_degenerate_boxes_and_emits_valid_context() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("heat3-step-{unique}.stp"));
+
+        write_step(
+            &path,
+            &[
+                [0.0, 0.0, 0.0, 1.0, 2.0, 3.0],
+                [2.0, 2.0, 2.0, 2.0, 4.0, 5.0],
+            ],
+        )
+        .unwrap();
+
+        let output = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(output.matches("MANIFOLD_SOLID_BREP").count(), 1);
+        assert!(output.contains("GEOMETRIC_REPRESENTATION_CONTEXT ( 3 )"));
+        assert!(output.contains("GLOBAL_UNIT_ASSIGNED_CONTEXT"));
+        assert!(output.contains("PRODUCT_DEFINITION_CONTEXT('',#1,'design')"));
+    }
+
+    #[test]
+    fn write_step_escapes_apostrophe_in_file_name() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("heat3-model's-{unique}.stp"));
+
+        write_step(&path, &[[0.0, 0.0, 0.0, 1.0, 2.0, 3.0]]).unwrap();
+
+        let output = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert!(
+            output.contains("FILE_NAME('heat3-model''s-"),
+            "STEP string literal must escape apostrophes: {output}"
+        );
+    }
+}

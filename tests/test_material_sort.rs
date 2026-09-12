@@ -1,0 +1,163 @@
+use heat3_povorotnik::material_sort::{
+    extract_material_entries, parse_mtl_file, sort_material_boxes_by_order,
+    sort_material_names_by_conductivity, write_mtl_file, MtlMaterial,
+};
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[test]
+fn test_extract_material_entries_preserves_first_seen_order() {
+    let script = "p\t0\t0\t0\t1\t1\t1\tBeta\t! material box\r\nb\t0\t0\t0\t1\t1\t1\t2\t! BC box\r\np\t0\t0\t0\t1\t1\t1\tAlpha\t! material box\r\np\t0\t0\t0\t1\t1\t1\tBeta\t! material box";
+    let entries = extract_material_entries(script);
+    let pairs: Vec<(&str, i32)> = entries.iter().map(|e| (e.name.as_str(), e.count)).collect();
+    assert_eq!(pairs, vec![("Beta", 2), ("Alpha", 1)]);
+}
+
+#[test]
+fn test_sort_material_boxes_reorders_only_material_box_lines() {
+    let script = "! header\r\np\t0\t0\t0\t1\t1\t1\tBeta\t! material box\r\nb\t0\t0\t0\t1\t1\t1\t2\t! BC box\r\np\t0\t0\t0\t1\t1\t1\tAlpha\t! material box\r\ne\t0\t0\t0\t1\t1\t1\tignored";
+    let result = sort_material_boxes_by_order(script, &["Alpha".to_string(), "Beta".to_string()]);
+    let lines: Vec<&str> = result.lines().collect();
+    assert_eq!(lines[0], "! header");
+    assert!(lines[1].ends_with("\tAlpha\t! material box"));
+    assert!(lines[2].ends_with("\t! BC box"));
+    assert!(lines[3].ends_with("\tBeta\t! material box"));
+    assert!(lines[4].starts_with("e\t"));
+    assert_eq!(result.matches('\t').count(), script.matches('\t').count());
+    assert_eq!(
+        result.matches("\r\n").count(),
+        script.matches("\r\n").count()
+    );
+}
+
+#[test]
+fn test_parse_mtl_file_reads_windows_1251_materials() {
+    let dir = std::env::temp_dir();
+    let path = dir.join("test_materials.mtl");
+
+    write_mtl_file(
+        &path,
+        &[
+            MtlMaterial {
+                name: "Бетон".to_string(),
+                thermal_x: 0.56,
+                thermal_y: 0.57,
+                volume_heat: 1000.0,
+                rgb_r: 1,
+                rgb_g: 2,
+                rgb_b: 3,
+                special_value: 4,
+            },
+            MtlMaterial {
+                name: "Alpha".to_string(),
+                thermal_x: 0.04,
+                thermal_y: 0.0,
+                volume_heat: 0.0,
+                rgb_r: 1,
+                rgb_g: 2,
+                rgb_b: 3,
+                special_value: 4,
+            },
+        ],
+    )
+    .unwrap();
+
+    let materials = parse_mtl_file(&path, false).unwrap();
+    std::fs::remove_file(&path).ok();
+
+    assert_eq!(materials.len(), 2);
+    assert_eq!(materials[0].name, "Бетон");
+    assert!((materials[0].thermal_x - 0.56).abs() < 1e-9);
+    assert!((materials[0].thermal_y - 0.57).abs() < 1e-9);
+    assert!((materials[0].volume_heat - 1000.0).abs() < 1e-9);
+    assert_eq!(materials[0].rgb_r, 1);
+    assert_eq!(materials[0].rgb_g, 2);
+    assert_eq!(materials[0].rgb_b, 3);
+    assert_eq!(materials[0].special_value, 4);
+
+    assert_eq!(materials[1].name, "Alpha");
+    assert!((materials[1].thermal_x - 0.04).abs() < 1e-9);
+}
+
+#[test]
+fn test_sort_material_names_by_thermal_conductivity_unknown_last() {
+    let mut map = HashMap::new();
+    map.insert(
+        "alpha".to_string(),
+        MtlMaterial {
+            name: "Alpha".to_string(),
+            thermal_x: 0.04,
+            thermal_y: 0.04,
+            volume_heat: 0.0,
+            rgb_r: 0,
+            rgb_g: 0,
+            rgb_b: 0,
+            special_value: 0,
+        },
+    );
+    map.insert(
+        "beta".to_string(),
+        MtlMaterial {
+            name: "Beta".to_string(),
+            thermal_x: 0.20,
+            thermal_y: 0.20,
+            volume_heat: 0.0,
+            rgb_r: 0,
+            rgb_g: 0,
+            rgb_b: 0,
+            special_value: 0,
+        },
+    );
+    let names = vec![
+        "Unknown".to_string(),
+        "Beta".to_string(),
+        "Alpha".to_string(),
+    ];
+    let result = sort_material_names_by_conductivity(&names, &map);
+    assert_eq!(result, vec!["Alpha", "Beta", "Unknown"]);
+}
+
+#[test]
+fn test_write_mtl_file_replaces_existing_file_atomically() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("heat3-mtl-{unique}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("materials.mtl");
+
+    std::fs::write(&path, b"stale").unwrap();
+    write_mtl_file(
+        &path,
+        &[MtlMaterial {
+            name: "Gamma".to_string(),
+            thermal_x: 0.15,
+            thermal_y: 0.15,
+            volume_heat: 100.0,
+            rgb_r: 5,
+            rgb_g: 6,
+            rgb_b: 7,
+            special_value: 8,
+        }],
+    )
+    .unwrap();
+
+    let materials = parse_mtl_file(&path, false).unwrap();
+    assert_eq!(materials.len(), 1);
+    assert_eq!(materials[0].name, "Gamma");
+
+    let leftovers = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect::<Vec<_>>();
+    assert!(
+        leftovers.is_empty(),
+        "temporary files leaked: {leftovers:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}

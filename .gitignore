@@ -1,0 +1,20 @@
+target/
+tools/license-admin/target/
+*.sync-conflict-*
+*.orig
+*.rej
+
+# Local builds and packaged binaries
+.codex-build/
+dist/
+
+# OS metadata and local credentials
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12

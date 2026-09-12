@@ -1,0 +1,231 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - ".github/workflows/rust.yml"
+      - "README.md"
+      - "docs/**"
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "assets/**"
+      - "resources/**"
+      - "scripts/**"
+      - "dist/**"
+      - "samples/**"
+      - "tools/check-source-hygiene.ps1"
+      - "tools/license-admin/**"
+      - "tools/release/**"
+  pull_request:
+    branches: [main, master, develop]
+    paths:
+      - ".github/workflows/rust.yml"
+      - "README.md"
+      - "docs/**"
+      - "src/**"
+      - "tests/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "assets/**"
+      - "resources/**"
+      - "scripts/**"
+      - "dist/**"
+      - "samples/**"
+      - "tools/check-source-hygiene.ps1"
+      - "tools/license-admin/**"
+      - "tools/release/**"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-msrv:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install minimum supported Rust
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: "1.88.0"
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: .
+
+      - name: Check minimum supported Rust
+        run: cargo check --locked
+
+  rust-client:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Check source hygiene
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: .\tools\check-source-hygiene.ps1
+
+      - name: Fail on committed release binaries
+        shell: pwsh
+        run: |
+          $dist = Join-Path $PWD 'dist'
+          if (Test-Path $dist) {
+            $executables = Get-ChildItem -Path $dist -Filter *.exe -File
+            if ($executables) {
+              $names = ($executables | Select-Object -ExpandProperty Name) -join ', '
+              throw "Remove committed executables from dist before merging: $names"
+            }
+          }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: .
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets --locked
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit Windows dependency graph
+        shell: pwsh
+        run: .\scripts\audit-windows.ps1
+
+  release-secret-scan:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: .
+
+      - name: Build release client with sentinel secrets
+        shell: pwsh
+        env:
+          HEAT3_KEYGEN_ADMIN_TOKEN: "__HEAT3_CI_SECRET_SENTINEL__"
+          HEAT3_KEYGEN_PRODUCT_TOKEN: "__HEAT3_CI_SECRET_SENTINEL__"
+        run: cargo build --release --locked
+
+      - name: Fail if a secret is embedded in the client binary
+        shell: pwsh
+        run: |
+          $binary = Join-Path $PWD 'target\release\heat3_povorotnik.exe'
+          $bytes = [IO.File]::ReadAllBytes($binary)
+          $text = [Text.Encoding]::ASCII.GetString($bytes)
+          $sentinel = '__HEAT3_CI_SECRET_SENTINEL__'
+          if ($text.Contains($sentinel)) {
+            throw "Admin/product token leaked into the client binary."
+          }
+          Write-Output "No embedded secrets in the client binary."
+
+  release-sign:
+    runs-on: windows-latest
+    needs: rust-client
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+    env:
+      HEAT3_CODESIGN_CERT_BASE64: ${{ secrets.HEAT3_CODESIGN_CERT_BASE64 }}
+      HEAT3_CODESIGN_CERT_PASSWORD: ${{ secrets.HEAT3_CODESIGN_CERT_PASSWORD }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: .
+
+      - name: Build release client
+        shell: pwsh
+        run: cargo build --release --locked
+
+      - name: Sign and package the release
+        if: env.HEAT3_CODESIGN_CERT_BASE64 != ''
+        shell: pwsh
+        run: .\tools\release\sign-and-package.ps1 -SkipIfNoCert
+
+      - name: Report unsigned build
+        if: env.HEAT3_CODESIGN_CERT_BASE64 == ''
+        shell: pwsh
+        run: |
+          Write-Output "No code-signing certificate configured (HEAT3_CODESIGN_CERT_BASE64)."
+          Write-Output "Release is UNSIGNED; set the secret and rerun for an Authenticode-signed package."
+
+      - name: Upload release package
+        if: env.HEAT3_CODESIGN_CERT_BASE64 != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: heat3-povorotnik-release
+          path: dist/*
+
+  license-admin:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: tools/license-admin
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          workspaces: tools/license-admin
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit dependencies
+        run: cargo audit

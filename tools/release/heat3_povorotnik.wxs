@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="HEAT3 Povorotnik" Language="1033"
+           Version="$(var.Heat3Version)" Manufacturer="HEAT Toolkit"
+           UpgradeCode="D5A2E3B1-7C84-4F2A-9B61-3E0D8C4A1F57">
+    <Package InstallerVersion="200" Compressed="yes" InstallScope="perMachine" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Feature Id="MainFeature" Title="HEAT3 Povorotnik" Level="1">
+      <ComponentRef Id="ApplicationFiles" />
+    </Feature>
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="HEAT3 Povorotnik">
+          <Component Id="ApplicationFiles" Guid="*">
+            <File Id="heat3_exe" Source="$(var.Heat3Exe)" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+  </Product>
+</Wix>
