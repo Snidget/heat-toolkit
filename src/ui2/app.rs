@@ -245,7 +245,39 @@ fn reload_material_cache(
     Ok(true)
 }
 
+fn message_allowed_while_unlicensed(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::Navigate(_)
+            | Message::About
+            | Message::CloseAbout
+            | Message::Settings
+            | Message::CloseSettings
+            | Message::SettingsTheme(_)
+            | Message::SettingsGrid(_)
+            | Message::CanvasHover
+            | Message::ModifiersChanged(_)
+            | Message::LicenseKeyChanged(_)
+            | Message::LicenseToggleReveal
+            | Message::LicensePaste
+            | Message::LicenseActivate
+            | Message::LicenseRefresh
+            | Message::LicenseConfirmDeactivate
+            | Message::LicenseCancelDeactivate
+            | Message::LicenseDeactivate
+            | Message::LicensePoll
+            | Message::WindowOpened
+    )
+}
+
 pub fn update(app: &mut App, message: Message) -> Task<Message> {
+    let snapshot = app.license_manager.snapshot();
+    if !snapshot.dev_mode
+        && !snapshot.access.is_allowed()
+        && !message_allowed_while_unlicensed(&message)
+    {
+        return Task::none();
+    }
     let mut task = Task::none();
     match message {
         Message::Navigate(page) => {
