@@ -740,6 +740,12 @@ mod tests {
         )
     }
 
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_compile_time_configuration_is_valid() {
+        assert!(KeygenConfig::from_compile_time().is_ok());
+    }
+
     fn config() -> KeygenConfig {
         KeygenConfig::new(
             "https://licensing.example.test",

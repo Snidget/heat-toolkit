@@ -175,6 +175,11 @@ jobs:
     env:
       HEAT3_CODESIGN_CERT_BASE64: ${{ secrets.HEAT3_CODESIGN_CERT_BASE64 }}
       HEAT3_CODESIGN_CERT_PASSWORD: ${{ secrets.HEAT3_CODESIGN_CERT_PASSWORD }}
+      HEAT3_KEYGEN_API_URL: ${{ vars.HEAT3_KEYGEN_API_URL }}
+      HEAT3_KEYGEN_ACCOUNT_ID: ${{ vars.HEAT3_KEYGEN_ACCOUNT_ID }}
+      HEAT3_KEYGEN_PRODUCT_ID: ${{ vars.HEAT3_KEYGEN_PRODUCT_ID }}
+      HEAT3_KEYGEN_POLICY_ID: ${{ vars.HEAT3_KEYGEN_POLICY_ID }}
+      HEAT3_KEYGEN_PUBLIC_KEY: ${{ vars.HEAT3_KEYGEN_PUBLIC_KEY }}
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -187,16 +192,24 @@ jobs:
         with:
           workspaces: .
 
-      - name: Build release client
-        shell: pwsh
-        run: cargo build --release --locked
-
-      - name: Require code-signing credentials
+      - name: Require release configuration
         shell: pwsh
         run: |
           if ([string]::IsNullOrWhiteSpace($env:HEAT3_CODESIGN_CERT_BASE64) -or [string]::IsNullOrWhiteSpace($env:HEAT3_CODESIGN_CERT_PASSWORD)) {
             throw "Trusted release signing requires HEAT3_CODESIGN_CERT_BASE64 and HEAT3_CODESIGN_CERT_PASSWORD."
           }
+          $requiredKeygenVariables = "HEAT3_KEYGEN_API_URL", "HEAT3_KEYGEN_ACCOUNT_ID", "HEAT3_KEYGEN_PRODUCT_ID", "HEAT3_KEYGEN_POLICY_ID", "HEAT3_KEYGEN_PUBLIC_KEY"
+          foreach ($variable in $requiredKeygenVariables) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($variable))) {
+              throw "Trusted release build requires the GitHub variable $variable."
+            }
+          }
+
+      - name: Build and verify release client configuration
+        shell: pwsh
+        run: |
+          cargo build --release --locked
+          cargo test --release --locked release_compile_time_configuration_is_valid
 
       - name: Sign and package the release
         shell: pwsh
