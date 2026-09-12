@@ -835,7 +835,7 @@ pub fn sort_materials(names: &mut Vec<String>, materials: &HashMap<String, MtlMa
     *names = sort_material_names_by_conductivity(names, materials);
 }
 pub fn parse_mtl(path: &std::path::Path) -> Result<Vec<MtlMaterial>, String> {
-    parse_mtl_file(path, false).map_err(|error| error.to_string())
+    parse_mtl_file(path, true).map_err(|error| error.to_string())
 }
 pub fn apply_air_cavity_upsert(
     path: &std::path::Path,

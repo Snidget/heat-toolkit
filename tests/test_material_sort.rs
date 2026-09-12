@@ -166,7 +166,7 @@ fn test_write_mtl_file_replaces_existing_file_atomically() {
     )
     .unwrap();
 
-    let materials = parse_mtl_file(&path, false).unwrap();
+    let materials = parse_mtl_file(&path, true).unwrap();
     assert_eq!(materials.len(), 1);
     assert_eq!(materials[0].name, "Gamma");
 
@@ -183,4 +183,33 @@ fn test_write_mtl_file_replaces_existing_file_atomically() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_strict_mtl_load_rejects_corrupt_records_and_trailing_bytes() {
+    let path = std::env::temp_dir().join("test_materials_corrupt.mtl");
+    let material = MtlMaterial {
+        name: "Valid".to_string(),
+        thermal_x: 0.15,
+        thermal_y: 0.15,
+        volume_heat: 100.0,
+        rgb_r: 5,
+        rgb_g: 6,
+        rgb_b: 7,
+        special_value: 8,
+    };
+    write_mtl_file(&path, &[material.clone(), material.clone(), material]).unwrap();
+
+    let mut corrupt_middle = std::fs::read(&path).unwrap();
+    corrupt_middle[RECORD_SIZE] = 255;
+    std::fs::write(&path, &corrupt_middle).unwrap();
+    assert!(parse_mtl_file(&path, true).is_err());
+    assert_eq!(parse_mtl_file(&path, false).unwrap().len(), 2);
+
+    let mut trailing = std::fs::read(&path).unwrap();
+    trailing.push(0);
+    std::fs::write(&path, trailing).unwrap();
+    assert!(parse_mtl_file(&path, true).is_err());
+
+    std::fs::remove_file(&path).ok();
 }

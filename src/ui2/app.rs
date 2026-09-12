@@ -269,7 +269,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 .add_filter("Material files", &["mtl", "MTL"])
                 .pick_file()
             {
-                match crate::material_sort::parse_mtl_file(&path, false) {
+                match crate::material_sort::parse_mtl_file(&path, true) {
                     Ok(materials) => {
                         let count = materials.len();
                         app.report.mtl_materials =
@@ -340,7 +340,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 .add_filter("Material files", &["mtl", "MTL"])
                 .pick_file()
             {
-                match crate::material_sort::parse_mtl_file(&path, false) {
+                match crate::material_sort::parse_mtl_file(&path, true) {
                     Ok(materials) => {
                         let mut map = std::collections::HashMap::new();
                         for material in &materials {
