@@ -406,21 +406,27 @@ pub fn selected_table_text(
     items: &[ReportItem],
     selected: &BTreeSet<(usize, usize)>,
 ) -> Option<String> {
-    let rows: BTreeSet<usize> = selected.iter().map(|(row, _)| *row).collect();
-    let columns: BTreeSet<usize> = selected.iter().map(|(_, column)| *column).collect();
-    if rows.is_empty() || columns.is_empty() {
+    let min_row = selected.iter().map(|(row, _)| *row).min()?;
+    let max_row = selected.iter().map(|(row, _)| *row).max()?;
+    let min_column = selected.iter().map(|(_, column)| *column).min()?;
+    let max_column = selected.iter().map(|(_, column)| *column).max()?;
+    if min_row >= items.len() {
         return None;
     }
-    let lines = rows
-        .into_iter()
-        .filter_map(|row| items.get(row))
-        .map(|item| {
-            columns
-                .iter()
-                .map(|column| match column {
-                    0 => item.name.clone(),
-                    1 => lambda_text(item.lambda),
-                    _ => String::new(),
+    let max_row = max_row.min(items.len() - 1);
+    let lines = (min_row..=max_row)
+        .map(|row| {
+            let item = &items[row];
+            (min_column..=max_column)
+                .map(|column| {
+                    if !selected.contains(&(row, column)) {
+                        return String::new();
+                    }
+                    match column {
+                        0 => item.name.clone(),
+                        1 => lambda_text(item.lambda),
+                        _ => String::new(),
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join("\t")
@@ -474,6 +480,15 @@ mod tests {
         assert_eq!(
             selected_table_text(&sample_items(), &selected).as_deref(),
             Some("Brick\t0.72\nUnknown\t—")
+        );
+    }
+
+    #[test]
+    fn selected_table_copy_preserves_sparse_cell_positions() {
+        let selected = BTreeSet::from([(0, 0), (1, 1)]);
+        assert_eq!(
+            selected_table_text(&sample_items(), &selected).as_deref(),
+            Some("Brick\t\n\t—")
         );
     }
 
