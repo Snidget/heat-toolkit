@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use iced::widget::{checkbox, column, container, row, scrollable, stack, text};
-use iced::{Element, Length, Subscription, Theme};
+use iced::{Element, Length, Subscription, Task, Theme};
 
 use super::interactive_pages::{CheckPage, Turner2DPage, TurnerPage};
 use super::license::LicensePage;
@@ -100,6 +100,7 @@ pub enum Message {
     CheckTolerance(String),
     CheckMaxChange(String),
     CheckTick,
+    CheckAnalysisCompleted(super::interactive_pages::CheckAnalysisResult),
     CheckProposalToggle(usize),
     CheckProposalCollapse(usize),
     CheckApplySelected,
@@ -194,7 +195,14 @@ impl Default for App {
     }
 }
 
-fn sync_script_fields(app: &mut App) {
+fn start_check_analysis(request: super::interactive_pages::CheckAnalysisRequest) -> Task<Message> {
+    Task::perform(
+        async move { super::interactive_pages::run_check_analysis(request) },
+        Message::CheckAnalysisCompleted,
+    )
+}
+
+fn sync_script_fields(app: &mut App) -> Task<Message> {
     app.turner.preview.show_grid = app.show_grid;
     app.turner_2d.preview.show_grid = app.show_grid;
     app.step_3d.sync_lines(&app.script_text);
@@ -203,10 +211,14 @@ fn sync_script_fields(app: &mut App) {
     app.corner.sync_script(&app.script_text);
     app.report.sync_script(&app.script_text);
     app.material_sort.sync_script(&app.script_text);
-    app.check.sync_script(&app.script_text);
+    app.check
+        .sync_script(&app.script_text)
+        .map(start_check_analysis)
+        .unwrap_or_else(Task::none)
 }
 
-pub fn update(app: &mut App, message: Message) {
+pub fn update(app: &mut App, message: Message) -> Task<Message> {
+    let mut task = Task::none();
     match message {
         Message::Navigate(page) => {
             app.page = page;
@@ -313,7 +325,7 @@ pub fn update(app: &mut App, message: Message) {
             }
             Ok(text) => {
                 app.script_text = text;
-                sync_script_fields(app);
+                task = sync_script_fields(app);
                 app.material_sort.status =
                     Some(("Скрипт вставлен из буфера обмена.".to_owned(), false));
             }
@@ -359,7 +371,7 @@ pub fn update(app: &mut App, message: Message) {
             );
             app.script_text =
                 super::static_pages::reorder_script(&app.script_text, &app.material_sort.names);
-            sync_script_fields(app);
+            task = sync_script_fields(app);
             app.material_sort.status = Some((
                 "Материалы отсортированы по теплопроводности.".to_owned(),
                 false,
@@ -385,7 +397,7 @@ pub fn update(app: &mut App, message: Message) {
             app.material_sort.move_item(index, delta);
             app.script_text =
                 super::static_pages::reorder_script(&app.script_text, &app.material_sort.names);
-            sync_script_fields(app);
+            task = sync_script_fields(app);
             app.material_sort.status = Some(("Порядок материалов изменён.".to_owned(), false));
         }
         Message::CornerPaste => match crate::clipboard::read_text() {
@@ -396,7 +408,7 @@ pub fn update(app: &mut App, message: Message) {
                 app.corner.result = None;
                 app.corner.result_lines.clear();
                 app.script_text = text;
-                sync_script_fields(app);
+                task = sync_script_fields(app);
                 app.corner.status = Some(("Скрипт вставлен из буфера обмена.".to_owned(), false));
             }
             Err(error) => {
@@ -412,7 +424,7 @@ pub fn update(app: &mut App, message: Message) {
                 app.corner.result = Some(result.clone());
                 app.corner.result_lines = crate::parser::parse_script(&result);
                 app.script_text = result;
-                sync_script_fields(app);
+                task = sync_script_fields(app);
             }
         }
         Message::CornerView(view) => {
@@ -525,16 +537,12 @@ pub fn update(app: &mut App, message: Message) {
         }
         Message::CheckPaste => match crate::clipboard::read_text() {
             Ok(text) if text.trim().is_empty() => {
-                app.check.analysis = None;
-                app.check.proposals.clear();
-                app.check.simplified = None;
-                app.check.cavity = None;
-                app.check.cached_script.clear();
+                app.check.clear();
                 app.check.status = Some(("Буфер обмена пуст.".to_owned(), true));
             }
             Ok(text) => {
                 app.script_text = text;
-                sync_script_fields(app);
+                task = sync_script_fields(app);
                 app.check.status = Some(("Скрипт вставлен из буфера обмена.".to_owned(), false));
             }
             Err(error) => {
@@ -559,7 +567,12 @@ pub fn update(app: &mut App, message: Message) {
             app.check.mark_pending();
         }
         Message::CheckTick => {
-            app.check.tick();
+            if let Some(request) = app.check.tick() {
+                task = start_check_analysis(request);
+            }
+        }
+        Message::CheckAnalysisCompleted(result) => {
+            app.check.apply_analysis(result);
         }
         Message::CheckProposalToggle(index) => {
             if let Some(value) = app.check.checked.get_mut(index) {
@@ -616,7 +629,7 @@ pub fn update(app: &mut App, message: Message) {
             }
             Ok(text) => {
                 app.script_text = text;
-                sync_script_fields(app);
+                task = sync_script_fields(app);
                 app.turner.status = Some(("Скрипт вставлен из буфера обмена.".to_owned(), false));
             }
             Err(error) => {
@@ -651,7 +664,7 @@ pub fn update(app: &mut App, message: Message) {
                 super::interactive_pages::transform_script(&app.script_text, name)
             {
                 app.script_text = result;
-                sync_script_fields(app);
+                task = sync_script_fields(app);
                 app.turner.status = Some(("Преобразование выполнено.".to_owned(), false));
             } else {
                 app.turner.status = Some((
@@ -715,7 +728,7 @@ pub fn update(app: &mut App, message: Message) {
             }
             Ok(text) => {
                 app.script_text = text;
-                sync_script_fields(app);
+                task = sync_script_fields(app);
                 app.step_3d.status = Some(("Скрипт вставлен из буфера обмена.".to_owned(), false));
             }
             Err(error) => {
@@ -745,6 +758,7 @@ pub fn update(app: &mut App, message: Message) {
         }
         Message::WindowOpened => super::platform::apply_titlebar_theme(is_dark(app)),
     }
+    task
 }
 
 pub fn view(app: &App) -> Element<'_, Message> {
