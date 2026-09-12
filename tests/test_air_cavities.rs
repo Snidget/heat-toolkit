@@ -106,6 +106,21 @@ fn test_format_air_cavity_name_rejects_unknown_field() {
 }
 
 #[test]
+fn test_format_air_cavity_name_rejects_unsafe_format_specs_before_formatting() {
+    let cavities = parse_air_cavities_info_log(SAMPLE_LOG).unwrap();
+    for mask in ["Air {n:.0g}", "Air {n:999999d}", "Air {n:.999999f}"] {
+        assert!(
+            format_air_cavity_name(mask, &cavities[0]).is_err(),
+            "expected {mask:?} to be rejected"
+        );
+    }
+    assert_eq!(
+        format_air_cavity_name("Air {n:03d} {lambda:.2f}", &cavities[0]).as_deref(),
+        Ok("Air 001 0.34")
+    );
+}
+
+#[test]
 fn test_build_air_cavity_materials_rejects_duplicate_generated_names() {
     let cavities = parse_air_cavities_info_log(SAMPLE_LOG).unwrap();
     let result = build_air_cavity_materials(&cavities, "Air", (10, 20, 30), 7);
