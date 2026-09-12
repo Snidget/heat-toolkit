@@ -104,7 +104,7 @@ try {
         $wixOut = Join-Path $env:TEMP ("heat3-wix-" + [guid]::NewGuid().ToString("N"))
         New-Item -ItemType Directory -Force -Path $wixOut | Out-Null
         try {
-            & $candle "-dHeat3Exe=$binary" "-dHeat3Version=$Version" -out "$wixOut\" $wxsPath
+            & $candle -arch x64 "-dHeat3Exe=$binary" "-dHeat3Version=$Version" -out "$wixOut\" $wxsPath
             if ($LASTEXITCODE -ne 0) {
                 throw "candle failed with exit code $LASTEXITCODE"
             }
