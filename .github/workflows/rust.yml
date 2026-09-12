@@ -140,7 +140,14 @@ jobs:
         env:
           HEAT3_KEYGEN_ADMIN_TOKEN: "__HEAT3_CI_SECRET_SENTINEL__"
           HEAT3_KEYGEN_PRODUCT_TOKEN: "__HEAT3_CI_SECRET_SENTINEL__"
+          HEAT3_DEV_LICENSE: "__HEAT3_CI_DEV_LICENSE_SENTINEL__"
         run: cargo build --release --locked
+
+      - name: Verify the development license bypass is disabled in release builds
+        shell: pwsh
+        env:
+          HEAT3_DEV_LICENSE: "__HEAT3_CI_DEV_LICENSE_SENTINEL__"
+        run: cargo test --release --locked development_license_bypass_is_disabled_in_release
 
       - name: Fail if a secret is embedded in the client binary
         shell: pwsh
@@ -151,6 +158,10 @@ jobs:
           $sentinel = '__HEAT3_CI_SECRET_SENTINEL__'
           if ($text.Contains($sentinel)) {
             throw "Admin/product token leaked into the client binary."
+          }
+          $devLicenseSentinel = '__HEAT3_CI_DEV_LICENSE_SENTINEL__'
+          if ($text.Contains($devLicenseSentinel)) {
+            throw "Development license bypass leaked into the client binary."
           }
           Write-Output "No embedded secrets in the client binary."
 
