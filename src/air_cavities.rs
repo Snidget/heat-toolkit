@@ -114,7 +114,7 @@ fn parse_positive_float(value: &str, label: &str) -> Result<f64, String> {
         .replace(',', ".")
         .parse::<f64>()
         .map_err(|_| format!("{}: некорректное число {:?}.", label, value))?;
-    if parsed <= 0.0 {
+    if !parsed.is_finite() || parsed <= 0.0 {
         return Err(format!("{}: значение должно быть больше 0.", label));
     }
     Ok(parsed)

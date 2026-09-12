@@ -1,6 +1,7 @@
 use heat3_povorotnik::material_sort::{
     extract_material_entries, parse_mtl_file, sort_material_boxes_by_order,
-    sort_material_names_by_conductivity, write_mtl_file, MtlMaterial,
+    sort_material_names_by_conductivity, write_mtl_file, MtlMaterial, NAME_FIELD_SIZE,
+    NUMERIC_FIELD_SIZE, RECORD_SIZE,
 };
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -77,6 +78,28 @@ fn test_parse_mtl_file_reads_windows_1251_materials() {
 
     assert_eq!(materials[1].name, "Alpha");
     assert!((materials[1].thermal_x - 0.04).abs() < 1e-9);
+}
+
+#[test]
+fn test_parse_mtl_file_rejects_non_finite_numeric_fields() {
+    let path = std::env::temp_dir().join("test_materials_non_finite.mtl");
+    let mut record = vec![0; RECORD_SIZE];
+    record[0] = 7;
+    record[1..8].copy_from_slice(b"Invalid");
+    let thermal_x_offset = 1 + NAME_FIELD_SIZE;
+    record[thermal_x_offset] = 3;
+    record[thermal_x_offset + 1..thermal_x_offset + 4].copy_from_slice(b"NaN");
+    let thermal_y_offset = thermal_x_offset + 1 + NUMERIC_FIELD_SIZE;
+    record[thermal_y_offset] = 3;
+    record[thermal_y_offset + 1..thermal_y_offset + 4].copy_from_slice(b"inf");
+    let volume_heat_offset = thermal_y_offset + 1 + NUMERIC_FIELD_SIZE;
+    record[volume_heat_offset] = 4;
+    record[volume_heat_offset + 1..volume_heat_offset + 5].copy_from_slice(b"-inf");
+    std::fs::write(&path, record).unwrap();
+
+    let error = parse_mtl_file(&path, true).unwrap_err();
+    std::fs::remove_file(&path).ok();
+    assert!(error.contains("non-finite"));
 }
 
 #[test]

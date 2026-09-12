@@ -183,9 +183,14 @@ fn to_float(raw: &[u8], label: &str) -> Result<f64, String> {
     if text.is_empty() {
         return Err(format!("{}: empty numeric field", label));
     }
-    text.replace(',', ".")
+    let parsed = text
+        .replace(',', ".")
         .parse::<f64>()
-        .map_err(|_| format!("{}: invalid numeric value {:?}", label, text))
+        .map_err(|_| format!("{}: invalid numeric value {:?}", label, text))?;
+    if !parsed.is_finite() {
+        return Err(format!("{}: non-finite numeric value {:?}", label, text));
+    }
+    Ok(parsed)
 }
 
 fn read_padded_field(

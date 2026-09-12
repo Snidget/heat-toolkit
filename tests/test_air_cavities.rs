@@ -44,6 +44,17 @@ fn test_parse_air_cavities_info_log_rejects_missing_matching_dimensions() {
 }
 
 #[test]
+fn test_parse_air_cavities_info_log_rejects_non_finite_values() {
+    for value in ["NaN", "inf", "-inf"] {
+        let log = SAMPLE_LOG.replacen("130", value, 1);
+        assert!(
+            parse_air_cavities_info_log(&log).is_err(),
+            "expected {value} to be rejected"
+        );
+    }
+}
+
+#[test]
 fn test_build_air_cavity_materials_uses_mask_color_and_special_value() {
     let cavities = parse_air_cavities_info_log(SAMPLE_LOG).unwrap();
     let specs = build_air_cavity_materials(
