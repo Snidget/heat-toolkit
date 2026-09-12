@@ -14,8 +14,6 @@ pub const NAME_FIELD_SIZE: usize = 50;
 pub const NUMERIC_FIELD_SIZE: usize = 10;
 pub const NAME_ENCODING: &str = "windows-1251";
 pub const NUMERIC_ENCODING: &str = "ascii";
-pub const MATERIAL_BOX_MARKER: &str = "! material box";
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct MaterialEntry {
     pub name: String,
@@ -57,16 +55,20 @@ pub fn normalize_material_name(name: &str) -> String {
 /// - `...;Имя`, `...//Имя`, `...#Имя` — имя ПОСЛЕ разделителя.
 ///   Возвращает нормализованное имя (как ключи в карте материалов).
 pub fn material_name_from_trailing(trailing: &str) -> String {
+    normalize_material_name(&material_name_text_from_trailing(trailing))
+}
+
+fn material_name_text_from_trailing(trailing: &str) -> String {
     let t = trailing.trim();
     if let Some(idx) = t.find('!') {
-        return normalize_material_name(&t[..idx]);
+        return t[..idx].trim().to_string();
     }
     for sep in [";", "//", "#"] {
         if let Some(idx) = t.find(sep) {
-            return normalize_material_name(&t[idx + sep.len()..]);
+            return t[idx + sep.len()..].trim().to_string();
         }
     }
-    normalize_material_name(t)
+    t.to_string()
 }
 
 fn split_line_ending(text: &str) -> (String, String) {
@@ -81,8 +83,7 @@ fn material_name_from_raw_line(raw_line: &str) -> Option<String> {
     if label != "p" {
         return None;
     }
-    let marker_index = line.trailing.to_lowercase().find(MATERIAL_BOX_MARKER)?;
-    let material_name = line.trailing[..marker_index].trim().to_string();
+    let material_name = material_name_text_from_trailing(&line.trailing);
     if material_name.is_empty() {
         None
     } else {

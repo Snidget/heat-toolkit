@@ -15,6 +15,16 @@ fn test_extract_material_entries_preserves_first_seen_order() {
 }
 
 #[test]
+fn test_extract_material_entries_accepts_commentless_and_commented_p_commands() {
+    let script = "p 0 0 0 1 1 1 Mineral wool\r\np 0 0 0 1 1 1 Brick ! hand-written note\r\nb 0 0 0 1 1 1 2 Mineral wool";
+
+    let entries = extract_material_entries(script);
+
+    let pairs: Vec<(&str, i32)> = entries.iter().map(|e| (e.name.as_str(), e.count)).collect();
+    assert_eq!(pairs, vec![("Mineral wool", 1), ("Brick", 1)]);
+}
+
+#[test]
 fn test_sort_material_boxes_reorders_only_material_box_lines() {
     let script = "! header\r\np\t0\t0\t0\t1\t1\t1\tBeta\t! material box\r\nb\t0\t0\t0\t1\t1\t1\t2\t! BC box\r\np\t0\t0\t0\t1\t1\t1\tAlpha\t! material box\r\ne\t0\t0\t0\t1\t1\t1\tignored";
     let result = sort_material_boxes_by_order(script, &["Alpha".to_string(), "Beta".to_string()]);
@@ -28,6 +38,18 @@ fn test_sort_material_boxes_reorders_only_material_box_lines() {
     assert_eq!(
         result.matches("\r\n").count(),
         script.matches("\r\n").count()
+    );
+}
+
+#[test]
+fn test_sort_material_boxes_reorders_commentless_p_commands() {
+    let script = "p 0 0 0 1 1 1 Beta\np 0 0 0 1 1 1 Alpha ! imported manually";
+
+    let result = sort_material_boxes_by_order(script, &["Alpha".to_string(), "Beta".to_string()]);
+
+    assert_eq!(
+        result,
+        "p 0 0 0 1 1 1 Alpha ! imported manually\np 0 0 0 1 1 1 Beta"
     );
 }
 
