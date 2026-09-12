@@ -62,6 +62,7 @@ pub struct MaterialSortPage {
     pub names: Vec<String>,
     pub status: Option<(String, bool)>,
     pub mtl_materials: HashMap<String, MtlMaterial>,
+    pub mtl_path: Option<PathBuf>,
     cached_script: String,
 }
 

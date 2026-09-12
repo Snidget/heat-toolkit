@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use iced::widget::{checkbox, column, container, row, scrollable, stack, text};
@@ -221,6 +223,28 @@ fn replace_shared_script(app: &mut App, script: String) -> Task<Message> {
     sync_script_fields(app)
 }
 
+fn same_mtl_path(left: &Path, right: &Path) -> bool {
+    let normalized_left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let normalized_right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    normalized_left == normalized_right
+}
+
+fn reload_material_cache(
+    source_path: Option<&PathBuf>,
+    cache: &mut HashMap<String, crate::material_sort::MtlMaterial>,
+    mutated_path: &Path,
+) -> Result<bool, String> {
+    let Some(source_path) = source_path else {
+        return Ok(false);
+    };
+    if !same_mtl_path(source_path, mutated_path) {
+        return Ok(false);
+    }
+    let materials = crate::material_sort::parse_mtl_file(mutated_path, true)?;
+    *cache = crate::material_sort::materials_by_normalized_name(&materials);
+    Ok(true)
+}
+
 pub fn update(app: &mut App, message: Message) -> Task<Message> {
     let mut task = Task::none();
     match message {
@@ -274,6 +298,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                         let count = materials.len();
                         app.report.mtl_materials =
                             crate::material_sort::materials_by_normalized_name(&materials);
+                        app.report.mtl_path = Some(path.clone());
                         app.report.refresh_items();
                         let colors = app.report.material_color_map();
                         app.step_3d.set_material_colors(colors.clone());
@@ -350,6 +375,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                             );
                         }
                         app.material_sort.mtl_materials = map;
+                        app.material_sort.mtl_path = Some(path.clone());
                         let colors = app.material_sort.color_map();
                         app.step_3d.set_material_colors(colors.clone());
                         app.corner.set_material_colors(colors);
@@ -463,12 +489,74 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                     &app.air_cavities,
                 ) {
                     Ok(result) => {
+                        let report_reload = reload_material_cache(
+                            app.report.mtl_path.as_ref(),
+                            &mut app.report.mtl_materials,
+                            path.as_path(),
+                        );
+                        let material_reload = reload_material_cache(
+                            app.material_sort.mtl_path.as_ref(),
+                            &mut app.material_sort.mtl_materials,
+                            path.as_path(),
+                        );
+                        let mut reload_errors = Vec::new();
+                        let mut refreshed_colors = None;
+                        match report_reload {
+                            Ok(true) => {
+                                app.report.refresh_items();
+                                refreshed_colors = Some(app.report.material_color_map());
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                app.report.mtl_materials.clear();
+                                app.report.refresh_items();
+                                app.report.status = Some((
+                                    format!("MTL требуется открыть повторно: {error}"),
+                                    true,
+                                ));
+                                reload_errors.push("шкала".to_owned());
+                            }
+                        }
+                        match material_reload {
+                            Ok(true) => {
+                                refreshed_colors
+                                    .get_or_insert_with(|| app.material_sort.color_map());
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                app.material_sort.mtl_materials.clear();
+                                app.material_sort.status = Some((
+                                    format!("MTL требуется открыть повторно: {error}"),
+                                    true,
+                                ));
+                                reload_errors.push("сортировка".to_owned());
+                            }
+                        }
+                        if reload_errors.is_empty() {
+                            if let Some(colors) = refreshed_colors {
+                                app.step_3d.set_material_colors(colors.clone());
+                                app.corner.set_material_colors(colors);
+                            }
+                        } else {
+                            app.step_3d.set_material_colors(HashMap::new());
+                            app.corner.set_material_colors(HashMap::new());
+                        }
                         let status = format!(
                             "Готово. Обновлено: {}, добавлено: {}",
                             result.updated_count(),
                             result.added_count()
                         );
-                        app.air_cavities.status = Some((status, false));
+                        app.air_cavities.status = Some((
+                            if reload_errors.is_empty() {
+                                status
+                            } else {
+                                format!(
+                                    "{status}. Не удалось обновить: {}.",
+                                    reload_errors.join(", ")
+                                )
+                            },
+                            !reload_errors.is_empty(),
+                        ));
                     }
                     Err(error) => {
                         app.air_cavities.status = Some((format!("Ошибка: {error}"), true));
@@ -1072,5 +1160,42 @@ mod tests {
 
         assert_eq!(app.turner_2d.preview.rects.len(), expected_rectangles);
         assert_eq!(app.check.cached_script, app.script_text);
+    }
+
+    #[test]
+    fn reload_material_cache_updates_only_the_mutated_source_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("heat3-cache-{unique}.mtl"));
+        let other_path = std::env::temp_dir().join(format!("heat3-cache-other-{unique}.mtl"));
+        let old = crate::material_sort::MtlMaterial {
+            name: "Air".to_owned(),
+            thermal_x: 0.1,
+            thermal_y: 0.1,
+            volume_heat: 0.0,
+            rgb_r: 1,
+            rgb_g: 2,
+            rgb_b: 3,
+            special_value: 0,
+        };
+        let mut updated = old.clone();
+        updated.thermal_x = 0.2;
+        crate::material_sort::write_mtl_file(&path, &[old.clone()]).unwrap();
+        crate::material_sort::write_mtl_file(&other_path, &[old]).unwrap();
+
+        let source = Some(path.clone());
+        let mut cache = HashMap::new();
+        cache.insert("air".to_owned(), updated.clone());
+        crate::material_sort::write_mtl_file(&path, &[updated]).unwrap();
+
+        assert!(reload_material_cache(source.as_ref(), &mut cache, &path).unwrap());
+        assert_eq!(cache["air"].thermal_x, 0.2);
+        assert!(!reload_material_cache(source.as_ref(), &mut cache, &other_path).unwrap());
+        assert_eq!(cache["air"].thermal_x, 0.2);
+
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(other_path).ok();
     }
 }

@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 
 use iced::widget::{button, column, container, row, scrollable, text};
 use iced::{Border, Color, Element, Length};
@@ -34,6 +35,7 @@ pub struct ReportPage {
     pub entries: Vec<MaterialEntry>,
     pub items: Vec<ReportItem>,
     pub mtl_materials: HashMap<String, MtlMaterial>,
+    pub mtl_path: Option<PathBuf>,
     pub selected_cells: BTreeSet<(usize, usize)>,
     pub selection_anchor: Option<(usize, usize)>,
     pub status: Option<(String, bool)>,
