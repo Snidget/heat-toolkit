@@ -12,11 +12,6 @@ fn starts_with_any(line: &str, prefixes: &[&str]) -> bool {
     prefixes.iter().any(|p| line.starts_with(*p))
 }
 
-fn line_re() -> &'static regex::Regex {
-    static RE: OnceLock<regex::Regex> = OnceLock::new();
-    RE.get_or_init(|| regex::Regex::new(r"^(p|b|e)\s+([\-\d.\s]+)(.*)$").unwrap())
-}
-
 fn number_token_re() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?").unwrap())
@@ -25,6 +20,15 @@ fn number_token_re() -> &'static regex::Regex {
 fn label_sep_re() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"^(p|b|e)(\s+)(.*)$").unwrap())
+}
+
+fn take_token(input: &str) -> Option<(&str, &str)> {
+    let trimmed = input.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    Some((&trimmed[..end], &trimmed[end..]))
 }
 
 pub fn parse_line(line: &str) -> ScriptLine {
@@ -41,40 +45,43 @@ pub fn parse_line(line: &str) -> ScriptLine {
     }
 
     let stripped = line.trim();
-    let caps = match line_re().captures(stripped) {
+    let caps = match label_sep_re().captures(stripped) {
         None => return ScriptLine::non_script(line),
         Some(c) => c,
     };
 
     let label = caps.get(1).unwrap().as_str().to_string();
-    let coords_raw = caps.get(2).unwrap().as_str();
-    let trailing_raw = caps.get(3).unwrap().as_str().trim().to_string();
-
-    let parts: Vec<&str> = coords_raw.split_whitespace().collect();
-    if parts.len() < 6 {
-        return ScriptLine::non_script(line);
-    }
+    let mut remainder = caps.get(3).unwrap().as_str();
 
     let mut nums = [0.0f64; 6];
-    for (i, p) in parts[..6].iter().enumerate() {
-        match p.parse::<f64>() {
+    for coordinate in &mut nums {
+        let Some((token, after_token)) = take_token(remainder) else {
+            return ScriptLine::non_script(line);
+        };
+        match token.parse::<f64>() {
             // Отклоняем NaN/inf/-inf: `parse::<f64>()` принимает их, но они не имеют смысла
             // как координаты HEAT3 и привели бы к panic в sort_by/cavity-detection下游.
-            Ok(v) if v.is_finite() => nums[i] = v,
+            Ok(v) if v.is_finite() => *coordinate = v,
             _ => return ScriptLine::non_script(line),
         }
+        remainder = after_token;
     }
 
     let mut extra_values: Vec<f64> = Vec::new();
     let mut extra_raw: Vec<String> = Vec::new();
-    if parts.len() > 6 {
-        for p in &parts[6..] {
-            if let Ok(v) = p.parse::<f64>() {
-                extra_values.push(v);
-                extra_raw.push(p.to_string());
+    if label == "b" {
+        while let Some((token, after_token)) = take_token(remainder) {
+            match token.parse::<f64>() {
+                Ok(v) if v.is_finite() => {
+                    extra_values.push(v);
+                    extra_raw.push(token.to_string());
+                    remainder = after_token;
+                }
+                _ => break,
             }
         }
     }
+    let trailing_raw = remainder.trim().to_string();
 
     ScriptLine {
         raw: line.to_string(),
@@ -226,4 +233,39 @@ pub fn serialize_script(lines: &[ScriptLine], line_break: &str) -> String {
         }
     }
     parts.concat()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numeric_leading_material_name_stays_in_trailing_text() {
+        for name in ["0.04 insulation", "12 brick"] {
+            let raw = format!("p 0 0 0 1 1 1 {name} ! material box");
+            let line = parse_line(&raw);
+
+            assert_eq!(line.trailing, format!("{name} ! material box"));
+            assert!(line.extra_values.is_empty());
+            assert!(serialize_line(&line).ends_with(&format!("{name} ! material box")));
+        }
+    }
+
+    #[test]
+    fn boundary_condition_fields_remain_transformable_metadata() {
+        let line = parse_line("b 0 0 0 1 1 1 2 %enable");
+
+        assert_eq!(line.extra_values, vec![2.0]);
+        assert_eq!(line.trailing, "%enable");
+        assert!(serialize_line(&line).ends_with("2 %enable"));
+    }
+
+    #[test]
+    fn empty_box_preserves_numeric_leading_trailing_text() {
+        let line = parse_line("e 0 0 0 1 1 1 0.04 cut-out");
+
+        assert_eq!(line.trailing, "0.04 cut-out");
+        assert!(line.extra_values.is_empty());
+        assert!(serialize_line(&line).ends_with("0.04 cut-out"));
+    }
 }
