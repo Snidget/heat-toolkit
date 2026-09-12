@@ -307,28 +307,6 @@ fn project_scene(
     faces
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn duplicate_geometry_keeps_each_lines_material_color() {
-        let lines = vec![
-            crate::parser::parse_line("p 0 0 0 1 1 1 Red ! material box"),
-            crate::parser::parse_line("p 0 0 0 1 1 1 Blue ! material box"),
-        ];
-        let red = Color::from_rgb(1.0, 0.0, 0.0);
-        let blue = Color::from_rgb(0.0, 0.0, 1.0);
-        let colors = HashMap::from([("red".to_owned(), red), ("blue".to_owned(), blue)]);
-
-        let segments = scene_segments(&lines, &colors);
-
-        assert_eq!(segments.len(), 2);
-        assert_eq!(segments[0].1, red);
-        assert_eq!(segments[1].1, blue);
-    }
-}
-
 struct BoxFace {
     vertices: [[f64; 3]; 4],
     center: [f64; 3],
@@ -585,5 +563,27 @@ impl<'a> canvas::Program<Canvas3DMessage> for Preview3D<'a> {
         } else {
             iced::mouse::Interaction::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_geometry_keeps_each_lines_material_color() {
+        let lines = vec![
+            crate::parser::parse_line("p 0 0 0 1 1 1 Red ! material box"),
+            crate::parser::parse_line("p 0 0 0 1 1 1 Blue ! material box"),
+        ];
+        let red = Color::from_rgb(1.0, 0.0, 0.0);
+        let blue = Color::from_rgb(0.0, 0.0, 1.0);
+        let colors = HashMap::from([("red".to_owned(), red), ("blue".to_owned(), blue)]);
+
+        let segments = scene_segments(&lines, &colors);
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].1, red);
+        assert_eq!(segments[1].1, blue);
     }
 }
