@@ -207,7 +207,7 @@ fn build_camera(
     bounds: Rectangle,
 ) -> Option<(Camera, [f64; 3], f64)> {
     let (center, radius) = scene_bounds(lines)?;
-    let el = elevation.clamp(-1.45, 1.45);
+    let el = elevation.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
     let dir = (el.cos() * azimuth.sin(), el.sin(), el.cos() * azimuth.cos());
 
     let dist = radius * 6.0 + 1.0;
@@ -585,5 +585,24 @@ mod tests {
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].1, red);
         assert_eq!(segments[1].1, blue);
+    }
+
+    #[test]
+    fn top_and_bottom_views_are_axis_aligned() {
+        let lines = vec![crate::parser::parse_line("p 0 0 0 1 1 1 material")];
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(400.0, 300.0));
+
+        for (view, expected_y) in [(StandardView::Top, 1.0), (StandardView::Bottom, -1.0)] {
+            let (azimuth, elevation) = standard_view_angles(view);
+            let (camera, center, _) = build_camera(&lines, azimuth, elevation, bounds).unwrap();
+            let camera_y = camera.position[1] - center[1];
+
+            assert!((camera.position[0] - center[0]).abs() < 1e-12);
+            assert!((camera.position[2] - center[2]).abs() < 1e-12);
+            assert!(camera_y * expected_y > 0.0);
+            assert!(camera.forward[0].abs() < 1e-12);
+            assert!((camera.forward[1] + expected_y).abs() < 1e-12);
+            assert!(camera.forward[2].abs() < 1e-12);
+        }
     }
 }
