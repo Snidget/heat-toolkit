@@ -125,7 +125,13 @@ pub fn format_segment_values(segment: &Segment) -> Vec<String> {
     segment
         .as_tuple()
         .iter()
-        .map(|c| format!("{:.4}", c))
+        .map(|c| {
+            if *c == 0.0 {
+                "0".to_string()
+            } else {
+                c.to_string()
+            }
+        })
         .collect()
 }
 
@@ -267,5 +273,28 @@ mod tests {
         assert_eq!(line.trailing, "0.04 cut-out");
         assert!(line.extra_values.is_empty());
         assert!(serialize_line(&line).ends_with("0.04 cut-out"));
+    }
+
+    #[test]
+    fn serializer_preserves_sub_millimetre_geometry() {
+        let line = parse_line("p -0.00001 0 0 0.00004 0.00002 1 thin ! material box");
+        let output = serialize_line(&line);
+        let round_tripped = parse_line(&output);
+
+        assert_eq!(
+            round_tripped.segment.unwrap().as_tuple(),
+            [-0.00001, 0.0, 0.0, 0.00004, 0.00002, 1.0]
+        );
+        assert!(!output.split_whitespace().any(|token| token == "-0"));
+    }
+
+    #[test]
+    fn serializer_normalizes_negative_zero_without_rounding_coordinates() {
+        let segment = Segment::new(-0.0, 1.0, 1.23456, -0.00001, 2.0, 3.0);
+
+        assert_eq!(
+            format_segment_values(&segment),
+            vec!["0", "1", "1.23456", "-0.00001", "2", "3"]
+        );
     }
 }
