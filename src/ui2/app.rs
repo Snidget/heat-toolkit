@@ -207,7 +207,6 @@ fn sync_script_fields(app: &mut App) -> Task<Message> {
     app.turner_2d.preview.show_grid = app.show_grid;
     app.step_3d.sync_lines(&app.script_text);
     app.turner.sync(&app.script_text);
-    app.turner_2d.sync(&app.script_text);
     app.corner.sync_script(&app.script_text);
     app.report.sync_script(&app.script_text);
     app.material_sort.sync_script(&app.script_text);
@@ -215,6 +214,11 @@ fn sync_script_fields(app: &mut App) -> Task<Message> {
         .sync_script(&app.script_text)
         .map(start_check_analysis)
         .unwrap_or_else(Task::none)
+}
+
+fn replace_shared_script(app: &mut App, script: String) -> Task<Message> {
+    app.script_text = script;
+    sync_script_fields(app)
 }
 
 pub fn update(app: &mut App, message: Message) -> Task<Message> {
@@ -250,10 +254,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 ));
             }
             Ok(text) => {
-                app.script_text = text;
-                app.report.sync_script(&app.script_text);
-                app.step_3d.sync_lines(&app.script_text);
-                app.turner.sync(&app.script_text);
+                task = replace_shared_script(app, text);
                 app.report.selected_cells.clear();
                 app.report.selection_anchor = None;
                 app.report.status = Some(("Скрипт вставлен из буфера обмена.".to_owned(), false));
@@ -1054,4 +1055,22 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         _ => None,
     });
     Subscription::batch([window_events, license_poll, check_tick, keyboard_events])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_script_sync_preserves_the_independent_2d_preview() {
+        let mut app = App::default();
+        app.script_text_2d = "r 0 0 2 3 cavity".to_owned();
+        app.turner_2d.sync(&app.script_text_2d);
+        let expected_rectangles = app.turner_2d.preview.rects.len();
+
+        let _ = replace_shared_script(&mut app, "p 0 0 0 1 1 1 material".to_owned());
+
+        assert_eq!(app.turner_2d.preview.rects.len(), expected_rectangles);
+        assert_eq!(app.check.cached_script, app.script_text);
+    }
 }
