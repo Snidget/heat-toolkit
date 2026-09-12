@@ -47,6 +47,14 @@ fn lambda_text(lambda: Option<f64>) -> String {
         .unwrap_or_else(|| "—".to_owned())
 }
 
+fn material_color(material: &MtlMaterial) -> Color {
+    Color::from_rgb(
+        material.rgb_r as f32 / 255.0,
+        material.rgb_g as f32 / 255.0,
+        material.rgb_b as f32 / 255.0,
+    )
+}
+
 fn compact_cell_label(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_owned();
@@ -111,16 +119,7 @@ impl ReportPage {
             .map(|entry| {
                 let key = normalize_material_name(&entry.name);
                 let material = self.mtl_materials.get(&key);
-                let color = material
-                    .filter(|m| m.rgb_r != 0 || m.rgb_g != 0 || m.rgb_b != 0)
-                    .map(|m| {
-                        Color::from_rgb(
-                            m.rgb_r as f32 / 255.0,
-                            m.rgb_g as f32 / 255.0,
-                            m.rgb_b as f32 / 255.0,
-                        )
-                    })
-                    .unwrap_or(theme::MUTED);
+                let color = material.map(material_color).unwrap_or(theme::MUTED);
                 let lambda = material.map(|m| m.thermal_x);
                 ReportItem {
                     name: entry.name.clone(),
@@ -145,11 +144,7 @@ impl ReportPage {
             .map(|(key, material)| {
                 (
                     key.clone(),
-                    Color::from_rgb(
-                        material.rgb_r as f32 / 255.0,
-                        material.rgb_g as f32 / 255.0,
-                        material.rgb_b as f32 / 255.0,
-                    ),
+                    material_color(material),
                 )
             })
             .collect()
@@ -474,6 +469,33 @@ mod tests {
         assert_eq!(&rgba[0..4], &[0, 0, 0, 255]);
         let interior = ((width + 1) * 4) as usize;
         assert_eq!(&rgba[interior..interior + 4], &[10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn report_uses_black_for_a_matching_black_mtl_material() {
+        let mut report = ReportPage::default();
+        report.entries = vec![MaterialEntry {
+            name: "Black".to_owned(),
+            count: 1,
+        }];
+        report.mtl_materials.insert(
+            "black".to_owned(),
+            MtlMaterial {
+                name: "Black".to_owned(),
+                thermal_x: 0.2,
+                thermal_y: 0.2,
+                volume_heat: 0.0,
+                rgb_r: 0,
+                rgb_g: 0,
+                rgb_b: 0,
+                special_value: 0,
+            },
+        );
+
+        report.refresh_items();
+
+        assert_eq!(report.items[0].color, Color::from_rgb(0.0, 0.0, 0.0));
+        assert_eq!(report.material_color_map()["black"], report.items[0].color);
     }
 
     #[test]
