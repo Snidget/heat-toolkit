@@ -5,7 +5,7 @@ use iced::{Element, Length};
 
 use crate::clipboard;
 use crate::parser::{parse_script, ScriptLine};
-use crate::step_export::write_step;
+use crate::step_export::{is_exportable_solid, write_step};
 
 use super::app::Message;
 use super::preview3d::{self, Canvas3DMessage, Preview3D, StandardView};
@@ -153,13 +153,30 @@ pub fn export_script(script: &str) -> Result<String, String> {
     if boxes.is_empty() {
         return Err("Нет данных для экспорта.".to_owned());
     }
+    let exportable_boxes = boxes
+        .iter()
+        .filter(|box_| is_exportable_solid(box_))
+        .count();
+    let skipped_degenerate_boxes = boxes.len() - exportable_boxes;
+    if exportable_boxes == 0 {
+        return Err(format!(
+            "Нет объёмных тел для экспорта. Пропущено вырожденных объектов: {skipped_degenerate_boxes}."
+        ));
+    }
     let path = rfd::FileDialog::new()
         .add_filter("STEP files", &["step", "stp"])
         .set_file_name("model.step")
         .save_file()
         .ok_or_else(|| "Экспорт отменён.".to_owned())?;
     write_step(&path, &boxes)
-        .map(|_| format!("Модель экспортирована: {}", path.display()))
+        .map(|summary| {
+            format!(
+                "Модель экспортирована: {}. Тел: {}; пропущено вырожденных: {}.",
+                path.display(),
+                summary.exported_boxes,
+                summary.skipped_degenerate_boxes
+            )
+        })
         .map_err(|error| format!("Ошибка экспорта STEP: {error}"))
 }
 pub fn paste() -> Result<String, String> {
