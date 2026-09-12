@@ -29,6 +29,18 @@ fn test_transform_2d_rotate_clockwise() {
 }
 
 #[test]
+fn test_transform_2d_accepts_and_preserves_uppercase_rectangle_commands() {
+    let script = "R 0.1 0.1 0.5 0.2 concrete, IEA\nr 0.3 0.4 0.7 0.2\ns 0 0 1 1";
+
+    let result = transform_2d_script(script, "rotate_clockwise").unwrap();
+
+    assert_eq!(
+        result,
+        "R 0.1 -0.5 0.2 -0.1 concrete, IEA\nr 0.2 -0.7 0.4 -0.3\ns 0 0 1 1"
+    );
+}
+
+#[test]
 fn test_transform_2d_rotate_counterclockwise() {
     let script = "r 0 0,43 0,2 0,69 acrylic resin, no cap., CEN\r\n acrylic resin, no cap., CEN ";
     let result = transform_2d_script(script, "rotate_counterclockwise").unwrap();

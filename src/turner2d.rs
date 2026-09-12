@@ -1,4 +1,4 @@
-//! 2D-преобразования прямоугольников (метка `r`).
+//! 2D-преобразования прямоугольников (метка `r` или `R`).
 
 use std::sync::OnceLock;
 
@@ -50,7 +50,7 @@ fn normalize_rect(points: [(f64, f64); 2]) -> Rect2D {
 }
 
 pub fn parse_2d_line(line: &str) -> ScriptLine2D {
-    if line.is_empty() || !line.starts_with('r') {
+    if line.is_empty() || !matches!(line.as_bytes().first(), Some(b'r' | b'R')) {
         return ScriptLine2D {
             raw: line.to_string(),
             rect: None,

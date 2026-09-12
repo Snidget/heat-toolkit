@@ -6,13 +6,14 @@ Add a separate `2D Поворотник` page for 2D HEAT script fragments witho
 
 ## Script Format
 
-Supported transformable lines start with `r` and contain four coordinates:
+Supported transformable lines start with `r` or `R` and contain four coordinates. The original
+command-letter case is preserved:
 
 ```text
 r x1 y1 x2 y2 material name
 ```
 
-Decimal numbers may use either comma or dot as a separator on input. Transformed output always uses dot as the decimal separator. The parser treats the four numeric fields as rectangle bounds. Any non-`r` line, malformed line, indentation, tab spacing, material tail, line order, and line endings must be preserved.
+Decimal numbers may use either comma or dot as a separator on input. Transformed output always uses dot as the decimal separator. The parser treats the four numeric fields as rectangle bounds. Any non-rectangle line, malformed line, indentation, tab spacing, material tail, line order, and line endings must be preserved.
 
 ## Buffer Ownership
 
