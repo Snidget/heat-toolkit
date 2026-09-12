@@ -10,6 +10,13 @@ fn fmt_r(value: f64) -> String {
     crate::text::format_real(value)
 }
 
+/// HEAT3 stores model coordinates in metres; this STEP writer declares millimetres.
+const METRES_TO_MILLIMETRES: f64 = 1_000.0;
+
+fn box_in_step_millimetres(box_: [f64; 6]) -> [f64; 6] {
+    box_.map(|coordinate| coordinate * METRES_TO_MILLIMETRES)
+}
+
 fn step_ref(n: usize) -> String {
     format!("#{}", n)
 }
@@ -363,7 +370,7 @@ pub fn write_step(path: &Path, boxes: &[[f64; 6]]) -> std::io::Result<StepExport
     let xdir = writer.direction([1.0, 0.0, 0.0]);
     let ydir = writer.direction([0.0, 1.0, 0.0]);
     let uncertainty = writer.add(&format!(
-        "UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-07),{},'','')",
+        "UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-04),{},'','')",
         step_ref(length_unit)
     ));
     let geom_ctx = writer.add(&format!(
@@ -377,6 +384,7 @@ pub fn write_step(path: &Path, boxes: &[[f64; 6]]) -> std::io::Result<StepExport
     let brep_ids: Vec<usize> = exportable_boxes
         .iter()
         .copied()
+        .map(box_in_step_millimetres)
         .map(|b| add_box(&mut writer, b, xdir, ydir))
         .collect();
     let items = brep_ids
@@ -522,6 +530,14 @@ mod tests {
     }
 
     #[test]
+    fn step_geometry_converts_heat3_metres_to_millimetres() {
+        assert_eq!(
+            box_in_step_millimetres([0.0, 0.0, 0.0, 1.0, 0.5, 0.1]),
+            [0.0, 0.0, 0.0, 1000.0, 500.0, 100.0]
+        );
+    }
+
+    #[test]
     fn write_step_skips_degenerate_boxes_and_emits_valid_context() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -546,6 +562,9 @@ mod tests {
         assert_eq!(summary.skipped_degenerate_boxes, 1);
         assert!(output.contains("GEOMETRIC_REPRESENTATION_CONTEXT ( 3 )"));
         assert!(output.contains("GLOBAL_UNIT_ASSIGNED_CONTEXT"));
+        assert!(output.contains("SI_UNIT ( .MILLI. , .METRE. )"));
+        assert!(output.contains("LENGTH_MEASURE(1.E-04)"));
+        assert!(output.contains("CARTESIAN_POINT('',(1000.0,2000.0,3000.0))"));
         assert!(output.contains("PRODUCT_DEFINITION_CONTEXT('',#1,'design')"));
     }
 
