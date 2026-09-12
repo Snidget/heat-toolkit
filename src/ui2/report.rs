@@ -141,12 +141,7 @@ impl ReportPage {
     pub fn material_color_map(&self) -> HashMap<String, Color> {
         self.mtl_materials
             .iter()
-            .map(|(key, material)| {
-                (
-                    key.clone(),
-                    material_color(material),
-                )
-            })
+            .map(|(key, material)| (key.clone(), material_color(material)))
             .collect()
     }
 
