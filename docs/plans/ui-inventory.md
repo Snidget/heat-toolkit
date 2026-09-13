@@ -26,7 +26,7 @@
 - Category-colored full-width action buttons preserve their existing labels and order.
 - Enabled/disabled states must follow current busy/configuration/data guards.
 - Status ladder: success, warning, error, info, muted; dark mode preserves readable contrast.
-- Hover tooltips exist for material rows, reorder actions, report scale, and instruction affordances.
+- Hover tooltips expose full truncated material names, describe reorder arrows, and explain the report-scale copy action.
 - Drag interactions: 3D rotation uses pointer delta; modifier semantics are preserved (Ctrl/Shift). 2D preview hover identifies segments.
 - Overlays: instruction and about dialogs are modal, non-resizable, centered, and explicitly dismissible.
 - Security: license keys are masked and zeroized; production builds must not embed dev-license secrets.

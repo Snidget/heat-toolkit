@@ -62,6 +62,7 @@ pub struct MaterialSortPage {
     pub names: Vec<String>,
     pub status: Option<(String, bool)>,
     pub mtl_materials: HashMap<String, MtlMaterial>,
+    pub mtl_path: Option<PathBuf>,
     cached_script: String,
 }
 
@@ -160,21 +161,27 @@ impl MaterialSortPage {
                             .spacing(theme::SPACE_2XS)
                             .width(Length::Fill),
                             column![
-                                super::widgets::square_button(
-                                    "↑",
-                                    if index > 0 {
-                                        Some(Message::MaterialMove(index, -1))
-                                    } else {
-                                        None
-                                    }
+                                super::widgets::with_tooltip(
+                                    super::widgets::square_button(
+                                        "↑",
+                                        if index > 0 {
+                                            Some(Message::MaterialMove(index, -1))
+                                        } else {
+                                            None
+                                        }
+                                    ),
+                                    "Переместить материал выше",
                                 ),
-                                super::widgets::square_button(
-                                    "↓",
-                                    if index + 1 < total {
-                                        Some(Message::MaterialMove(index, 1))
-                                    } else {
-                                        None
-                                    }
+                                super::widgets::with_tooltip(
+                                    super::widgets::square_button(
+                                        "↓",
+                                        if index + 1 < total {
+                                            Some(Message::MaterialMove(index, 1))
+                                        } else {
+                                            None
+                                        }
+                                    ),
+                                    "Переместить материал ниже",
                                 ),
                             ]
                             .spacing(theme::SPACE_2XS),
@@ -835,7 +842,7 @@ pub fn sort_materials(names: &mut Vec<String>, materials: &HashMap<String, MtlMa
     *names = sort_material_names_by_conductivity(names, materials);
 }
 pub fn parse_mtl(path: &std::path::Path) -> Result<Vec<MtlMaterial>, String> {
-    parse_mtl_file(path, false).map_err(|error| error.to_string())
+    parse_mtl_file(path, true).map_err(|error| error.to_string())
 }
 pub fn apply_air_cavity_upsert(
     path: &std::path::Path,

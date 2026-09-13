@@ -555,10 +555,19 @@ impl AuditLog {
         match load_audit_state(&state_path)? {
             Some(saved) => {
                 saved.verify(key)?;
-                if saved.entry_count != state.entry_count
-                    || saved.byte_len != state.byte_len
-                    || saved.previous_mac != state.previous_mac
+                if saved.entry_count == state.entry_count
+                    && saved.byte_len == state.byte_len
+                    && saved.previous_mac == state.previous_mac
                 {
+                    // The durable journal and its signed checkpoint agree.
+                } else if saved.entry_count < state.entry_count
+                    && saved.byte_len < state.byte_len
+                    && audit_state_is_exact_prefix(&mut file, key, &saved)?
+                {
+                    // The entry was synced before the sidecar replacement. The verified
+                    // HMAC-chain suffix is a crash-forward state, not a rollback.
+                    persist_audit_state(&state_path, &state)?;
+                } else {
                     return Err("Audit log усечён или заменён; операции заблокированы".to_owned());
                 }
             }
@@ -676,6 +685,43 @@ fn verified_audit_state(file: &mut fs::File, key: &[u8]) -> Result<AuditState, S
         .map_err(|_| "Не удалось прочитать размер audit log")?
         .len();
     AuditState::signed(entry_count, byte_len, previous, key)
+}
+
+fn audit_state_is_exact_prefix(
+    file: &mut fs::File,
+    key: &[u8],
+    saved: &AuditState,
+) -> Result<bool, String> {
+    let byte_len = file
+        .metadata()
+        .map_err(|_| "Не удалось прочитать размер audit log")?
+        .len();
+    if saved.byte_len > byte_len {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| "Не удалось позиционировать audit log")?;
+    let mut prefix = vec![0; saved.byte_len as usize];
+    file.read_exact(&mut prefix)
+        .map_err(|_| "Не удалось прочитать audit log")?;
+    let text =
+        std::str::from_utf8(&prefix).map_err(|_| "Audit log повреждён; операции заблокированы")?;
+    if !text.is_empty() && !text.ends_with('\n') {
+        return Ok(false);
+    }
+    let mut previous = "GENESIS".to_owned();
+    let mut entry_count = 0u64;
+    for line in text.lines() {
+        let entry: AuditEntry = serde_json::from_str(line)
+            .map_err(|_| "Audit log повреждён; операции заблокированы")?;
+        let payload = entry_without_mac(&entry)?;
+        if entry.previous_mac != previous || compute_mac(key, &payload)? != entry.mac {
+            return Ok(false);
+        }
+        previous = entry.mac;
+        entry_count += 1;
+    }
+    Ok(entry_count == saved.entry_count && previous == saved.previous_mac)
 }
 
 fn audit_state_path(path: &Path) -> PathBuf {
@@ -826,6 +872,40 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_state_recovers_a_valid_synced_suffix_after_a_crash() {
+        let path = env::temp_dir().join(format!(
+            "heat3-admin-audit-recovery-{}.jsonl",
+            std::process::id()
+        ));
+        let state_path = audit_state_path(&path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&state_path);
+        let key = b"01234567890123456789012345678901";
+        {
+            let mut log = AuditLog::open(path.clone(), key).unwrap();
+            log.append("license.show", "license-1", "attempt", None)
+                .unwrap();
+        }
+        let stale_state = fs::read(&state_path).unwrap();
+        {
+            let mut log = AuditLog::open(path.clone(), key).unwrap();
+            log.append("license.show", "license-1", "result", Some(true))
+                .unwrap();
+            log.append("license.list", "account", "attempt", None)
+                .unwrap();
+        }
+        fs::write(&state_path, stale_state).unwrap();
+
+        assert!(AuditLog::open(path.clone(), key).is_ok());
+        let state = load_audit_state(&state_path).unwrap().unwrap();
+        assert_eq!(state.entry_count, 3);
+        state.verify(key).unwrap();
+
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(path);
+    }
     use std::sync::{Mutex, OnceLock};
 
     fn environment_lock() -> &'static Mutex<()> {

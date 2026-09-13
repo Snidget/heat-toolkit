@@ -52,14 +52,20 @@ impl Default for LicenseManager {
 }
 
 impl LicenseManager {
-    /// True when the binary was compiled with `HEAT3_DEV_LICENSE` set.
-    /// In that mode licensing is simulated: every feature is unlocked and no
-    /// Keygen server is contacted. Never enabled for production builds.
+    /// True only in debug builds compiled with `HEAT3_DEV_LICENSE` set.
+    /// Production builds do not compile the bypass at all.
+    #[cfg(debug_assertions)]
     pub fn development_mode() -> bool {
         option_env!("HEAT3_DEV_LICENSE").is_some()
     }
 
+    #[cfg(not(debug_assertions))]
+    pub const fn development_mode() -> bool {
+        false
+    }
+
     pub fn new() -> Self {
+        #[cfg(debug_assertions)]
         if Self::development_mode() {
             return Self::development();
         }
@@ -80,6 +86,7 @@ impl LicenseManager {
         manager
     }
 
+    #[cfg(debug_assertions)]
     fn development() -> Self {
         let now = unix_now().unwrap_or(0);
         let lease = LicenseLease::new(
@@ -212,6 +219,7 @@ impl LicenseManager {
 
     /// Poll from the UI frame; never waits for the network worker.
     pub fn poll(&mut self) -> bool {
+        #[cfg(debug_assertions)]
         if Self::development_mode() {
             return false;
         }
@@ -997,6 +1005,12 @@ fn configuration_message() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn development_license_bypass_is_disabled_in_release() {
+        assert!(!LicenseManager::development_mode());
+    }
+
     use super::*;
     use crate::licensing::{
         AccessMode, HardwareComponent, HardwareComponentKind, HARDWARE_SCHEMA_VERSION,

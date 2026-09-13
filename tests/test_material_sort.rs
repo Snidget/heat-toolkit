@@ -1,6 +1,7 @@
 use heat3_povorotnik::material_sort::{
     extract_material_entries, parse_mtl_file, sort_material_boxes_by_order,
-    sort_material_names_by_conductivity, write_mtl_file, MtlMaterial,
+    sort_material_names_by_conductivity, write_mtl_file, MtlMaterial, NAME_FIELD_SIZE,
+    NUMERIC_FIELD_SIZE, RECORD_SIZE,
 };
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,6 +12,16 @@ fn test_extract_material_entries_preserves_first_seen_order() {
     let entries = extract_material_entries(script);
     let pairs: Vec<(&str, i32)> = entries.iter().map(|e| (e.name.as_str(), e.count)).collect();
     assert_eq!(pairs, vec![("Beta", 2), ("Alpha", 1)]);
+}
+
+#[test]
+fn test_extract_material_entries_accepts_commentless_and_commented_p_commands() {
+    let script = "p 0 0 0 1 1 1 Mineral wool\r\np 0 0 0 1 1 1 Brick ! hand-written note\r\nb 0 0 0 1 1 1 2 Mineral wool";
+
+    let entries = extract_material_entries(script);
+
+    let pairs: Vec<(&str, i32)> = entries.iter().map(|e| (e.name.as_str(), e.count)).collect();
+    assert_eq!(pairs, vec![("Mineral wool", 1), ("Brick", 1)]);
 }
 
 #[test]
@@ -27,6 +38,18 @@ fn test_sort_material_boxes_reorders_only_material_box_lines() {
     assert_eq!(
         result.matches("\r\n").count(),
         script.matches("\r\n").count()
+    );
+}
+
+#[test]
+fn test_sort_material_boxes_reorders_commentless_p_commands() {
+    let script = "p 0 0 0 1 1 1 Beta\np 0 0 0 1 1 1 Alpha ! imported manually";
+
+    let result = sort_material_boxes_by_order(script, &["Alpha".to_string(), "Beta".to_string()]);
+
+    assert_eq!(
+        result,
+        "p 0 0 0 1 1 1 Alpha ! imported manually\np 0 0 0 1 1 1 Beta"
     );
 }
 
@@ -77,6 +100,28 @@ fn test_parse_mtl_file_reads_windows_1251_materials() {
 
     assert_eq!(materials[1].name, "Alpha");
     assert!((materials[1].thermal_x - 0.04).abs() < 1e-9);
+}
+
+#[test]
+fn test_parse_mtl_file_rejects_non_finite_numeric_fields() {
+    let path = std::env::temp_dir().join("test_materials_non_finite.mtl");
+    let mut record = vec![0; RECORD_SIZE];
+    record[0] = 7;
+    record[1..8].copy_from_slice(b"Invalid");
+    let thermal_x_offset = 1 + NAME_FIELD_SIZE;
+    record[thermal_x_offset] = 3;
+    record[thermal_x_offset + 1..thermal_x_offset + 4].copy_from_slice(b"NaN");
+    let thermal_y_offset = thermal_x_offset + 1 + NUMERIC_FIELD_SIZE;
+    record[thermal_y_offset] = 3;
+    record[thermal_y_offset + 1..thermal_y_offset + 4].copy_from_slice(b"inf");
+    let volume_heat_offset = thermal_y_offset + 1 + NUMERIC_FIELD_SIZE;
+    record[volume_heat_offset] = 4;
+    record[volume_heat_offset + 1..volume_heat_offset + 5].copy_from_slice(b"-inf");
+    std::fs::write(&path, record).unwrap();
+
+    let error = parse_mtl_file(&path, true).unwrap_err();
+    std::fs::remove_file(&path).ok();
+    assert!(error.contains("non-finite"));
 }
 
 #[test]
@@ -143,7 +188,7 @@ fn test_write_mtl_file_replaces_existing_file_atomically() {
     )
     .unwrap();
 
-    let materials = parse_mtl_file(&path, false).unwrap();
+    let materials = parse_mtl_file(&path, true).unwrap();
     assert_eq!(materials.len(), 1);
     assert_eq!(materials[0].name, "Gamma");
 
@@ -160,4 +205,33 @@ fn test_write_mtl_file_replaces_existing_file_atomically() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_strict_mtl_load_rejects_corrupt_records_and_trailing_bytes() {
+    let path = std::env::temp_dir().join("test_materials_corrupt.mtl");
+    let material = MtlMaterial {
+        name: "Valid".to_string(),
+        thermal_x: 0.15,
+        thermal_y: 0.15,
+        volume_heat: 100.0,
+        rgb_r: 5,
+        rgb_g: 6,
+        rgb_b: 7,
+        special_value: 8,
+    };
+    write_mtl_file(&path, &[material.clone(), material.clone(), material]).unwrap();
+
+    let mut corrupt_middle = std::fs::read(&path).unwrap();
+    corrupt_middle[RECORD_SIZE] = 255;
+    std::fs::write(&path, &corrupt_middle).unwrap();
+    assert!(parse_mtl_file(&path, true).is_err());
+    assert_eq!(parse_mtl_file(&path, false).unwrap().len(), 2);
+
+    let mut trailing = std::fs::read(&path).unwrap();
+    trailing.push(0);
+    std::fs::write(&path, trailing).unwrap();
+    assert!(parse_mtl_file(&path, true).is_err());
+
+    std::fs::remove_file(&path).ok();
 }

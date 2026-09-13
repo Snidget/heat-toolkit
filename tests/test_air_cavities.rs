@@ -44,6 +44,17 @@ fn test_parse_air_cavities_info_log_rejects_missing_matching_dimensions() {
 }
 
 #[test]
+fn test_parse_air_cavities_info_log_rejects_non_finite_values() {
+    for value in ["NaN", "inf", "-inf"] {
+        let log = SAMPLE_LOG.replacen("130", value, 1);
+        assert!(
+            parse_air_cavities_info_log(&log).is_err(),
+            "expected {value} to be rejected"
+        );
+    }
+}
+
+#[test]
 fn test_build_air_cavity_materials_uses_mask_color_and_special_value() {
     let cavities = parse_air_cavities_info_log(SAMPLE_LOG).unwrap();
     let specs = build_air_cavity_materials(
@@ -92,6 +103,21 @@ fn test_format_air_cavity_name_rejects_unknown_field() {
     let result = format_air_cavity_name("Air {unknown}", &cavities[0]);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("Неизвестное поле"));
+}
+
+#[test]
+fn test_format_air_cavity_name_rejects_unsafe_format_specs_before_formatting() {
+    let cavities = parse_air_cavities_info_log(SAMPLE_LOG).unwrap();
+    for mask in ["Air {n:.0g}", "Air {n:999999d}", "Air {n:.999999f}"] {
+        assert!(
+            format_air_cavity_name(mask, &cavities[0]).is_err(),
+            "expected {mask:?} to be rejected"
+        );
+    }
+    assert_eq!(
+        format_air_cavity_name("Air {n:03d} {lambda:.2f}", &cavities[0]).as_deref(),
+        Ok("Air 001 0.34")
+    );
 }
 
 #[test]

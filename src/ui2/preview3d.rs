@@ -77,6 +77,24 @@ fn material_name_from_trailing(trailing: &str) -> String {
     crate::material_sort::material_name_from_trailing(trailing)
 }
 
+fn scene_segments(
+    lines: &[ScriptLine],
+    material_colors: &HashMap<String, Color>,
+) -> Vec<(Segment, Color)> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let segment = line.segment?;
+            let default_fill = shape_color_solid(label_char(line));
+            let fill = material_colors
+                .get(&material_name_from_trailing(&line.trailing))
+                .copied()
+                .unwrap_or(default_fill);
+            Some((segment, fill))
+        })
+        .collect()
+}
+
 #[derive(Default)]
 pub struct Preview3DState {
     pub drag_origin: Option<Point>,
@@ -189,7 +207,7 @@ fn build_camera(
     bounds: Rectangle,
 ) -> Option<(Camera, [f64; 3], f64)> {
     let (center, radius) = scene_bounds(lines)?;
-    let el = elevation.clamp(-1.45, 1.45);
+    let el = elevation.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
     let dir = (el.cos() * azimuth.sin(), el.sin(), el.cos() * azimuth.cos());
 
     let dist = radius * 6.0 + 1.0;
@@ -247,36 +265,13 @@ fn project_scene(
         return Vec::new();
     };
 
-    let segments: Vec<(char, Segment, Color)> = lines
-        .iter()
-        .filter_map(|line| line.segment.map(|segment| (label_char(line), segment)))
-        .map(|(label, segment)| {
-            let default_fill = shape_color_solid(label);
-            let fill = if material_colors.is_empty() {
-                default_fill
-            } else {
-                let key = material_name_from_trailing(
-                    lines
-                        .iter()
-                        .find(|line| line.segment == Some(segment))
-                        .map(|line| line.trailing.as_str())
-                        .unwrap_or(""),
-                );
-                if key.is_empty() {
-                    default_fill
-                } else {
-                    material_colors.get(&key).copied().unwrap_or(default_fill)
-                }
-            };
-            (label, segment, fill)
-        })
-        .collect();
+    let segments = scene_segments(lines, material_colors);
     if segments.is_empty() {
         return Vec::new();
     }
 
     let mut faces = Vec::new();
-    for (_, segment, fill) in &segments {
+    for (segment, fill) in &segments {
         for face in box_faces(*segment, *fill, &light) {
             let [v0, v1, v2, v3] = face.vertices;
             let mut out = [[0.0f64; 2]; 4];
@@ -567,6 +562,47 @@ impl<'a> canvas::Program<Canvas3DMessage> for Preview3D<'a> {
             iced::mouse::Interaction::Grabbing
         } else {
             iced::mouse::Interaction::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_geometry_keeps_each_lines_material_color() {
+        let lines = vec![
+            crate::parser::parse_line("p 0 0 0 1 1 1 Red ! material box"),
+            crate::parser::parse_line("p 0 0 0 1 1 1 Blue ! material box"),
+        ];
+        let red = Color::from_rgb(1.0, 0.0, 0.0);
+        let blue = Color::from_rgb(0.0, 0.0, 1.0);
+        let colors = HashMap::from([("red".to_owned(), red), ("blue".to_owned(), blue)]);
+
+        let segments = scene_segments(&lines, &colors);
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].1, red);
+        assert_eq!(segments[1].1, blue);
+    }
+
+    #[test]
+    fn top_and_bottom_views_are_axis_aligned() {
+        let lines = vec![crate::parser::parse_line("p 0 0 0 1 1 1 material")];
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(400.0, 300.0));
+
+        for (view, expected_y) in [(StandardView::Top, 1.0), (StandardView::Bottom, -1.0)] {
+            let (azimuth, elevation) = standard_view_angles(view);
+            let (camera, center, _) = build_camera(&lines, azimuth, elevation, bounds).unwrap();
+            let camera_y = camera.position[1] - center[1];
+
+            assert!((camera.position[0] - center[0]).abs() < 1e-12);
+            assert!((camera.position[2] - center[2]).abs() < 1e-12);
+            assert!(camera_y * expected_y > 0.0);
+            assert!(camera.forward[0].abs() < 1e-12);
+            assert!((camera.forward[1] + expected_y).abs() < 1e-12);
+            assert!(camera.forward[2].abs() < 1e-12);
         }
     }
 }

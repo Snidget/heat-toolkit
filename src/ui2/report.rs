@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::path::PathBuf;
 
 use iced::widget::{button, column, container, row, scrollable, text};
 use iced::{Border, Color, Element, Length};
@@ -12,7 +13,7 @@ use super::app::Message;
 use super::theme;
 use super::widgets::{
     hero_metric, page_button, page_button_maybe, selectable_button, selectable_data_button,
-    separator, status_text,
+    separator, status_text, with_tooltip,
 };
 
 const SCALE_WIDTH: f32 = 36.0;
@@ -34,6 +35,7 @@ pub struct ReportPage {
     pub entries: Vec<MaterialEntry>,
     pub items: Vec<ReportItem>,
     pub mtl_materials: HashMap<String, MtlMaterial>,
+    pub mtl_path: Option<PathBuf>,
     pub selected_cells: BTreeSet<(usize, usize)>,
     pub selection_anchor: Option<(usize, usize)>,
     pub status: Option<(String, bool)>,
@@ -43,6 +45,14 @@ fn lambda_text(lambda: Option<f64>) -> String {
     lambda
         .map(|value| crate::text::format_g(value, 6))
         .unwrap_or_else(|| "—".to_owned())
+}
+
+fn material_color(material: &MtlMaterial) -> Color {
+    Color::from_rgb(
+        material.rgb_r as f32 / 255.0,
+        material.rgb_g as f32 / 255.0,
+        material.rgb_b as f32 / 255.0,
+    )
 }
 
 fn compact_cell_label(value: &str, max_chars: usize) -> String {
@@ -109,16 +119,7 @@ impl ReportPage {
             .map(|entry| {
                 let key = normalize_material_name(&entry.name);
                 let material = self.mtl_materials.get(&key);
-                let color = material
-                    .filter(|m| m.rgb_r != 0 || m.rgb_g != 0 || m.rgb_b != 0)
-                    .map(|m| {
-                        Color::from_rgb(
-                            m.rgb_r as f32 / 255.0,
-                            m.rgb_g as f32 / 255.0,
-                            m.rgb_b as f32 / 255.0,
-                        )
-                    })
-                    .unwrap_or(theme::MUTED);
+                let color = material.map(material_color).unwrap_or(theme::MUTED);
                 let lambda = material.map(|m| m.thermal_x);
                 ReportItem {
                     name: entry.name.clone(),
@@ -140,16 +141,7 @@ impl ReportPage {
     pub fn material_color_map(&self) -> HashMap<String, Color> {
         self.mtl_materials
             .iter()
-            .map(|(key, material)| {
-                (
-                    key.clone(),
-                    Color::from_rgb(
-                        material.rgb_r as f32 / 255.0,
-                        material.rgb_g as f32 / 255.0,
-                        material.rgb_b as f32 / 255.0,
-                    ),
-                )
-            })
+            .map(|(key, material)| (key.clone(), material_color(material)))
             .collect()
     }
 
@@ -309,10 +301,12 @@ impl ReportPage {
                 })),
             )
             .spacing(0);
-            let scale = button(container(scale_strip).padding(1))
+            let scale: Element<'_, Message> = button(container(scale_strip).padding(1))
                 .padding(0)
                 .style(theme::data_button_style)
-                .on_press(Message::ReportCopyScale);
+                .on_press(Message::ReportCopyScale)
+                .into();
+            let scale = with_tooltip(scale, "Копировать шкалу как изображение");
 
             let header = row![
                 text("Материал")
@@ -327,19 +321,21 @@ impl ReportPage {
             .height(Length::Fixed(UI_ROW_HEIGHT))
             .align_y(iced::Alignment::Center);
             let rows = items.iter().enumerate().map(|(row_index, item)| {
+                let compact_name = compact_cell_label(&item.name, 20);
+                let material_cell = selectable_button(
+                    compact_name.clone(),
+                    self.selected_cells.contains(&(row_index, 0)),
+                    Message::ReportSelect(row_index, 0, modifiers.shift(), modifiers.command()),
+                    UI_ROW_HEIGHT,
+                    Length::Fill,
+                );
+                let material_cell = if compact_name == item.name {
+                    material_cell
+                } else {
+                    with_tooltip(material_cell, item.name.clone())
+                };
                 row![
-                        selectable_button(
-                            compact_cell_label(&item.name, 20),
-                            self.selected_cells.contains(&(row_index, 0)),
-                            Message::ReportSelect(
-                                row_index,
-                                0,
-                                modifiers.shift(),
-                                modifiers.command(),
-                            ),
-                            UI_ROW_HEIGHT,
-                            Length::Fill,
-                        ),
+                        material_cell,
                         selectable_data_button(
                             lambda_text(item.lambda),
                             self.selected_cells.contains(&(row_index, 1)),
@@ -406,21 +402,27 @@ pub fn selected_table_text(
     items: &[ReportItem],
     selected: &BTreeSet<(usize, usize)>,
 ) -> Option<String> {
-    let rows: BTreeSet<usize> = selected.iter().map(|(row, _)| *row).collect();
-    let columns: BTreeSet<usize> = selected.iter().map(|(_, column)| *column).collect();
-    if rows.is_empty() || columns.is_empty() {
+    let min_row = selected.iter().map(|(row, _)| *row).min()?;
+    let max_row = selected.iter().map(|(row, _)| *row).max()?;
+    let min_column = selected.iter().map(|(_, column)| *column).min()?;
+    let max_column = selected.iter().map(|(_, column)| *column).max()?;
+    if min_row >= items.len() {
         return None;
     }
-    let lines = rows
-        .into_iter()
-        .filter_map(|row| items.get(row))
-        .map(|item| {
-            columns
-                .iter()
-                .map(|column| match column {
-                    0 => item.name.clone(),
-                    1 => lambda_text(item.lambda),
-                    _ => String::new(),
+    let max_row = max_row.min(items.len() - 1);
+    let lines = (min_row..=max_row)
+        .map(|row| {
+            let item = &items[row];
+            (min_column..=max_column)
+                .map(|column| {
+                    if !selected.contains(&(row, column)) {
+                        return String::new();
+                    }
+                    match column {
+                        0 => item.name.clone(),
+                        1 => lambda_text(item.lambda),
+                        _ => String::new(),
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join("\t")
@@ -469,11 +471,49 @@ mod tests {
     }
 
     #[test]
+    fn report_uses_black_for_a_matching_black_mtl_material() {
+        let mut report = ReportPage {
+            entries: vec![MaterialEntry {
+                name: "Black".to_owned(),
+                count: 1,
+            }],
+            ..Default::default()
+        };
+        report.mtl_materials.insert(
+            "black".to_owned(),
+            MtlMaterial {
+                name: "Black".to_owned(),
+                thermal_x: 0.2,
+                thermal_y: 0.2,
+                volume_heat: 0.0,
+                rgb_r: 0,
+                rgb_g: 0,
+                rgb_b: 0,
+                special_value: 0,
+            },
+        );
+
+        report.refresh_items();
+
+        assert_eq!(report.items[0].color, Color::from_rgb(0.0, 0.0, 0.0));
+        assert_eq!(report.material_color_map()["black"], report.items[0].color);
+    }
+
+    #[test]
     fn selected_table_copy_preserves_selected_rectangle() {
         let selected = BTreeSet::from([(0, 0), (0, 1), (1, 0), (1, 1)]);
         assert_eq!(
             selected_table_text(&sample_items(), &selected).as_deref(),
             Some("Brick\t0.72\nUnknown\t—")
+        );
+    }
+
+    #[test]
+    fn selected_table_copy_preserves_sparse_cell_positions() {
+        let selected = BTreeSet::from([(0, 0), (1, 1)]);
+        assert_eq!(
+            selected_table_text(&sample_items(), &selected).as_deref(),
+            Some("Brick\t\n\t—")
         );
     }
 

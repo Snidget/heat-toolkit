@@ -106,9 +106,19 @@ pub fn format_plane_usage(usage: &PlaneUsage) -> String {
     )
 }
 
-fn collect_positive_boxes(script_text: &str) -> Vec<Box3D> {
-    let mut boxes: Vec<Box3D> = Vec::new();
+struct CavityGeometry {
+    plane_boxes: Vec<Box3D>,
+    occupancy_operations: Vec<(bool, Box3D)>,
+}
+
+fn collect_cavity_geometry(script_text: &str) -> CavityGeometry {
+    let mut plane_boxes = Vec::new();
+    let mut occupancy_operations = Vec::new();
     for line in parse_script(script_text) {
+        let label = line.label.as_deref();
+        if !matches!(label, Some("p" | "b" | "e")) {
+            continue;
+        }
         let segment = match line.segment {
             None => continue,
             Some(s) => s,
@@ -126,16 +136,28 @@ fn collect_positive_boxes(script_text: &str) -> Vec<Box3D> {
         {
             continue;
         }
-        boxes.push(Box3D {
+        let box_ = Box3D {
             x1: min_x,
             y1: min_y,
             z1: min_z,
             x2: max_x,
             y2: max_y,
             z2: max_z,
-        });
+        };
+        // HEAT3 applies overlapping objects in script order: a later material
+        // box fills cells, while an `e` box cuts them out. BC boxes contribute
+        // mesh planes, but are surfaces rather than material volume.
+        plane_boxes.push(box_);
+        match label {
+            Some("p") => occupancy_operations.push((true, box_)),
+            Some("e") => occupancy_operations.push((false, box_)),
+            _ => {}
+        }
     }
-    boxes
+    CavityGeometry {
+        plane_boxes,
+        occupancy_operations,
+    }
 }
 
 fn unique_sorted_coords(boxes: &[Box3D], axis: char) -> Vec<f64> {
@@ -193,8 +215,8 @@ fn neighbors(
 }
 
 pub fn detect_internal_cavities(script_text: &str, cell_limit: usize) -> CavityCheckResult {
-    let boxes = collect_positive_boxes(script_text);
-    if boxes.is_empty() {
+    let geometry = collect_cavity_geometry(script_text);
+    if geometry.plane_boxes.is_empty() || geometry.occupancy_operations.is_empty() {
         return CavityCheckResult {
             cavities: Vec::new(),
             skipped: false,
@@ -203,9 +225,9 @@ pub fn detect_internal_cavities(script_text: &str, cell_limit: usize) -> CavityC
         };
     }
 
-    let x_coords = unique_sorted_coords(&boxes, 'x');
-    let y_coords = unique_sorted_coords(&boxes, 'y');
-    let z_coords = unique_sorted_coords(&boxes, 'z');
+    let x_coords = unique_sorted_coords(&geometry.plane_boxes, 'x');
+    let y_coords = unique_sorted_coords(&geometry.plane_boxes, 'y');
+    let z_coords = unique_sorted_coords(&geometry.plane_boxes, 'z');
     let nx = (x_coords.len() as isize - 1).max(0) as usize;
     let ny = (y_coords.len() as isize - 1).max(0) as usize;
     let nz = (z_coords.len() as isize - 1).max(0) as usize;
@@ -245,7 +267,7 @@ pub fn detect_internal_cavities(script_text: &str, cell_limit: usize) -> CavityC
         .collect();
     let mut occupied = vec![0u8; cell_count];
 
-    for box_ in &boxes {
+    for (is_material, box_) in &geometry.occupancy_operations {
         let ix1 = x_index[&normalize_plane(box_.x1)];
         let ix2 = x_index[&normalize_plane(box_.x2)];
         let iy1 = y_index[&normalize_plane(box_.y1)];
@@ -256,7 +278,7 @@ pub fn detect_internal_cavities(script_text: &str, cell_limit: usize) -> CavityC
             for iy in iy1..iy2 {
                 let base = (ix * ny + iy) * nz;
                 for iz in iz1..iz2 {
-                    occupied[base + iz] = 1;
+                    occupied[base + iz] = u8::from(*is_material);
                 }
             }
         }
@@ -512,6 +534,13 @@ pub struct SimplifyAnalysis {
     pub after_planes: Option<PlaneUsage>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SimplifyProposalsResult {
+    pub script: String,
+    pub applied_count: usize,
+    pub rejected: Vec<MergeProposal>,
+}
+
 impl SimplifyAnalysis {
     pub fn total_saved(&self) -> i32 {
         match &self.after_planes {
@@ -690,18 +719,59 @@ pub fn simplify_planes(script_text: &str, tolerance: f64, max_change_percent: f6
     serialize_script(&lines, crate::config::LINE_BREAK)
 }
 
-pub fn simplify_proposals(script_text: &str, proposals: &[MergeProposal]) -> String {
+/// Replays displayed proposals in order, validating each against the model that
+/// the preceding selected proposals actually produced. A proposal may be unsafe
+/// when an earlier proposal it depended on was deselected.
+pub fn simplify_proposals(
+    script_text: &str,
+    proposals: &[MergeProposal],
+    tolerance: f64,
+    max_change_percent: f64,
+) -> SimplifyProposalsResult {
     let axis_index = [("X", 0), ("Y", 1), ("Z", 2)];
+    let tolerance_m = tolerance / 1000.0;
+    let max_change_ratio = max_change_percent / 100.0;
     let mut lines = parse_script(script_text);
+    let mut applied_count = 0;
+    let mut rejected = Vec::new();
     for prop in proposals {
-        let axis = axis_index
+        let Some(axis) = axis_index
             .iter()
             .find(|(name, _)| *name == prop.axis)
             .map(|(_, i)| *i)
-            .unwrap_or(0);
+        else {
+            rejected.push(prop.clone());
+            continue;
+        };
+        if prop.gap > tolerance_m + TOL
+            || !prop.coord_from.is_finite()
+            || !prop.coord_to.is_finite()
+        {
+            rejected.push(prop.clone());
+            continue;
+        }
+        let Some(revalidated) = build_proposal(
+            &lines,
+            axis,
+            prop.coord_from,
+            prop.coord_to,
+            max_change_ratio,
+        ) else {
+            rejected.push(prop.clone());
+            continue;
+        };
+        if revalidated.changes.is_empty() {
+            rejected.push(prop.clone());
+            continue;
+        }
         apply_merge(&mut lines, axis, prop.coord_from, prop.coord_to);
+        applied_count += 1;
     }
-    serialize_script(&lines, crate::config::LINE_BREAK)
+    SimplifyProposalsResult {
+        script: serialize_script(&lines, crate::config::LINE_BREAK),
+        applied_count,
+        rejected,
+    }
 }
 
 fn simplify_axis(lines: &mut [ScriptLine], axis: usize, tolerance: f64, max_change_ratio: f64) {
