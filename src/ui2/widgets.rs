@@ -1,7 +1,7 @@
 // Shared widget kit for the HEAT3 desktop utility.
 // JetBrains Mono carries the technical display register; Inter carries UI copy.
 
-use iced::widget::{button, column, container, row, rule, text, tooltip, Column};
+use iced::widget::{button, column, container, mouse_area, row, rule, text, tooltip, Column};
 use iced::{Background, Border, Color, Element, Font, Length, Theme};
 
 use super::app::Message;
@@ -307,7 +307,7 @@ pub fn status_panel<'a>(
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn modal<'a>(body: Element<'a, Message>, width: f32) -> Element<'a, Message> {
-    container(
+    let backdrop = container(
         container(body)
             .width(Length::Fixed(width))
             .padding(theme::SPACE_LG)
@@ -320,8 +320,16 @@ pub fn modal<'a>(body: Element<'a, Message>, width: f32) -> Element<'a, Message>
     .style(move |theme| container::Style {
         background: Some(Background::Color(theme::backdrop(theme::is_dark(theme)))),
         ..Default::default()
-    })
-    .into()
+    });
+    // `stack` forwards events to lower layers unless an overlay captures them.
+    // The card's controls receive events first; this shield consumes any input
+    // on the dimmed backdrop and intentionally leaves the dialog open.
+    mouse_area(backdrop)
+        .on_press(Message::ModalBackdrop)
+        .on_right_press(Message::ModalBackdrop)
+        .on_middle_press(Message::ModalBackdrop)
+        .on_scroll(|_| Message::ModalBackdrop)
+        .into()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

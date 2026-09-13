@@ -56,6 +56,7 @@ pub enum Message {
     CloseSettings,
     SettingsTheme(AppTheme),
     SettingsGrid(bool),
+    ModalBackdrop,
     CanvasHover,
     ReportSelect(usize, usize, bool, bool),
     ReportPaste,
@@ -255,6 +256,7 @@ fn message_allowed_while_unlicensed(message: &Message) -> bool {
             | Message::CloseSettings
             | Message::SettingsTheme(_)
             | Message::SettingsGrid(_)
+            | Message::ModalBackdrop
             | Message::CanvasHover
             | Message::ModifiersChanged(_)
             | Message::LicenseKeyChanged(_)
@@ -298,6 +300,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             app.turner.preview.cache.clear();
             app.turner_2d.preview.cache.clear();
         }
+        Message::ModalBackdrop => {}
         Message::CanvasHover => {}
         Message::ReportSelect(row, column, shift, command) => {
             app.report.select_cell((row, column), shift, command)
