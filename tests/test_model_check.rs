@@ -1,5 +1,6 @@
 use heat3_povorotnik::model_check::{
-    count_model_planes, detect_internal_cavities, format_cavity_check,
+    count_model_planes, detect_internal_cavities, format_cavity_check, simplify_proposals,
+    MergeProposal,
 };
 
 fn box_line(x1: i32, y1: i32, z1: i32, x2: i32, y2: i32, z2: i32, label: &str) -> String {
@@ -133,4 +134,32 @@ fn test_detect_internal_cavities_skips_large_grid() {
     assert!(result.skipped);
     assert!(result.cavities.is_empty());
     assert_eq!(result.cell_count, 27);
+}
+
+fn merge_proposal(axis: &str, coord_from: f64, coord_to: f64) -> MergeProposal {
+    MergeProposal {
+        axis: axis.to_owned(),
+        coord_from,
+        coord_to,
+        gap: (coord_to - coord_from).abs(),
+        changes: Vec::new(),
+    }
+}
+
+#[test]
+fn test_simplify_proposals_revalidates_when_a_prerequisite_is_deselected() {
+    let script = "p 0 0 0 1 1 1 Material";
+    let first = merge_proposal("X", 0.0, -0.06);
+    let second = merge_proposal("X", 1.0, 0.90);
+
+    let all_selected = simplify_proposals(script, &[first.clone(), second.clone()], 100.0, 9.5);
+    assert_eq!(all_selected.applied_count, 2);
+    assert!(all_selected.rejected.is_empty());
+    assert!(all_selected.script.contains("-0.06"));
+    assert!(all_selected.script.contains("0.9"));
+
+    let later_only = simplify_proposals(script, &[second], 100.0, 9.5);
+    assert_eq!(later_only.applied_count, 0);
+    assert_eq!(later_only.rejected.len(), 1);
+    assert_eq!(later_only.script, script);
 }

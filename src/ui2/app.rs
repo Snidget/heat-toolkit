@@ -718,19 +718,54 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 if selected.is_empty() {
                     app.check.status = Some(("Не выбрано ни одного упрощения.".to_owned(), true));
                 } else {
-                    app.check.simplified = Some(crate::model_check::simplify_proposals(
+                    let result = crate::model_check::simplify_proposals(
                         &app.script_text,
                         &selected,
-                    ));
+                        app.check.tolerance.trim().parse().unwrap_or_default(),
+                        app.check.max_change.trim().parse().unwrap_or_default(),
+                    );
+                    if result.rejected.is_empty() {
+                        app.check.status = Some((
+                            format!("Применено упрощений: {}.", result.applied_count),
+                            false,
+                        ));
+                    } else {
+                        let rejected = result
+                            .rejected
+                            .iter()
+                            .map(|proposal| {
+                                format!(
+                                    "{} {} → {}",
+                                    proposal.axis, proposal.coord_from, proposal.coord_to
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        app.check.status = Some((
+                            format!(
+                                "Применено: {}. Пропущено как небезопасные: {rejected}.",
+                                result.applied_count
+                            ),
+                            true,
+                        ));
+                    }
+                    app.check.simplified = Some(result.script);
                 }
             }
         }
         Message::CheckSimplifyAll => {
             if !app.script_text.trim().is_empty() && !app.check.proposals.is_empty() {
-                app.check.simplified = Some(crate::model_check::simplify_proposals(
+                let result = crate::model_check::simplify_proposals(
                     &app.script_text,
                     &app.check.proposals,
+                    app.check.tolerance.trim().parse().unwrap_or_default(),
+                    app.check.max_change.trim().parse().unwrap_or_default(),
+                );
+                app.check.status = Some((
+                    format!("Применено упрощений: {}.", result.applied_count),
+                    !result.rejected.is_empty(),
                 ));
+                app.check.simplified = Some(result.script);
             }
         }
         Message::CheckCopy => {

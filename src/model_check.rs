@@ -534,6 +534,13 @@ pub struct SimplifyAnalysis {
     pub after_planes: Option<PlaneUsage>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SimplifyProposalsResult {
+    pub script: String,
+    pub applied_count: usize,
+    pub rejected: Vec<MergeProposal>,
+}
+
 impl SimplifyAnalysis {
     pub fn total_saved(&self) -> i32 {
         match &self.after_planes {
@@ -712,18 +719,59 @@ pub fn simplify_planes(script_text: &str, tolerance: f64, max_change_percent: f6
     serialize_script(&lines, crate::config::LINE_BREAK)
 }
 
-pub fn simplify_proposals(script_text: &str, proposals: &[MergeProposal]) -> String {
+/// Replays displayed proposals in order, validating each against the model that
+/// the preceding selected proposals actually produced. A proposal may be unsafe
+/// when an earlier proposal it depended on was deselected.
+pub fn simplify_proposals(
+    script_text: &str,
+    proposals: &[MergeProposal],
+    tolerance: f64,
+    max_change_percent: f64,
+) -> SimplifyProposalsResult {
     let axis_index = [("X", 0), ("Y", 1), ("Z", 2)];
+    let tolerance_m = tolerance / 1000.0;
+    let max_change_ratio = max_change_percent / 100.0;
     let mut lines = parse_script(script_text);
+    let mut applied_count = 0;
+    let mut rejected = Vec::new();
     for prop in proposals {
-        let axis = axis_index
+        let Some(axis) = axis_index
             .iter()
             .find(|(name, _)| *name == prop.axis)
             .map(|(_, i)| *i)
-            .unwrap_or(0);
+        else {
+            rejected.push(prop.clone());
+            continue;
+        };
+        if prop.gap > tolerance_m + TOL
+            || !prop.coord_from.is_finite()
+            || !prop.coord_to.is_finite()
+        {
+            rejected.push(prop.clone());
+            continue;
+        }
+        let Some(revalidated) = build_proposal(
+            &lines,
+            axis,
+            prop.coord_from,
+            prop.coord_to,
+            max_change_ratio,
+        ) else {
+            rejected.push(prop.clone());
+            continue;
+        };
+        if revalidated.changes.is_empty() {
+            rejected.push(prop.clone());
+            continue;
+        }
         apply_merge(&mut lines, axis, prop.coord_from, prop.coord_to);
+        applied_count += 1;
     }
-    serialize_script(&lines, crate::config::LINE_BREAK)
+    SimplifyProposalsResult {
+        script: serialize_script(&lines, crate::config::LINE_BREAK),
+        applied_count,
+        rejected,
+    }
 }
 
 fn simplify_axis(lines: &mut [ScriptLine], axis: usize, tolerance: f64, max_change_ratio: f64) {
