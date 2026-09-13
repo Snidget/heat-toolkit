@@ -1,7 +1,7 @@
 // Shared widget kit for the HEAT3 desktop utility.
 // JetBrains Mono carries the technical display register; Inter carries UI copy.
 
-use iced::widget::{button, column, container, row, rule, text, Column};
+use iced::widget::{button, column, container, row, rule, text, tooltip, Column};
 use iced::{Background, Border, Color, Element, Font, Length, Theme};
 
 use super::app::Message;
@@ -216,6 +216,29 @@ pub fn square_button<'a>(label: &'a str, message: Option<Message>) -> Element<'a
         .style(move |theme: &Theme, status| style_fn(theme, status))
         .on_press_maybe(message)
         .into()
+}
+
+/// Hover help for compact controls where their visible label omits useful context.
+pub fn with_tooltip<'a>(
+    content: Element<'a, Message>,
+    hint: impl Into<String>,
+) -> Element<'a, Message> {
+    tooltip(
+        content,
+        container(
+            text(hint.into())
+                .size(theme::SMALL_SIZE)
+                .font(body_font(false))
+                .style(|theme| text::Style {
+                    color: Some(theme::ink(theme::is_dark(theme))),
+                }),
+        )
+        .padding(theme::SPACE_XS)
+        .style(theme::card),
+        tooltip::Position::FollowCursor,
+    )
+    .gap(theme::SPACE_XS)
+    .into()
 }
 
 /// Intrinsic-width button for controls that sit beside an expanding field.

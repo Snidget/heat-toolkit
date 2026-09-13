@@ -161,21 +161,27 @@ impl MaterialSortPage {
                             .spacing(theme::SPACE_2XS)
                             .width(Length::Fill),
                             column![
-                                super::widgets::square_button(
-                                    "↑",
-                                    if index > 0 {
-                                        Some(Message::MaterialMove(index, -1))
-                                    } else {
-                                        None
-                                    }
+                                super::widgets::with_tooltip(
+                                    super::widgets::square_button(
+                                        "↑",
+                                        if index > 0 {
+                                            Some(Message::MaterialMove(index, -1))
+                                        } else {
+                                            None
+                                        }
+                                    ),
+                                    "Переместить материал выше",
                                 ),
-                                super::widgets::square_button(
-                                    "↓",
-                                    if index + 1 < total {
-                                        Some(Message::MaterialMove(index, 1))
-                                    } else {
-                                        None
-                                    }
+                                super::widgets::with_tooltip(
+                                    super::widgets::square_button(
+                                        "↓",
+                                        if index + 1 < total {
+                                            Some(Message::MaterialMove(index, 1))
+                                        } else {
+                                            None
+                                        }
+                                    ),
+                                    "Переместить материал ниже",
                                 ),
                             ]
                             .spacing(theme::SPACE_2XS),

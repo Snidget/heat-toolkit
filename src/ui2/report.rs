@@ -13,7 +13,7 @@ use super::app::Message;
 use super::theme;
 use super::widgets::{
     hero_metric, page_button, page_button_maybe, selectable_button, selectable_data_button,
-    separator, status_text,
+    separator, status_text, with_tooltip,
 };
 
 const SCALE_WIDTH: f32 = 36.0;
@@ -301,10 +301,12 @@ impl ReportPage {
                 })),
             )
             .spacing(0);
-            let scale = button(container(scale_strip).padding(1))
+            let scale: Element<'_, Message> = button(container(scale_strip).padding(1))
                 .padding(0)
                 .style(theme::data_button_style)
-                .on_press(Message::ReportCopyScale);
+                .on_press(Message::ReportCopyScale)
+                .into();
+            let scale = with_tooltip(scale, "Копировать шкалу как изображение");
 
             let header = row![
                 text("Материал")
@@ -319,19 +321,21 @@ impl ReportPage {
             .height(Length::Fixed(UI_ROW_HEIGHT))
             .align_y(iced::Alignment::Center);
             let rows = items.iter().enumerate().map(|(row_index, item)| {
+                let compact_name = compact_cell_label(&item.name, 20);
+                let material_cell = selectable_button(
+                    compact_name.clone(),
+                    self.selected_cells.contains(&(row_index, 0)),
+                    Message::ReportSelect(row_index, 0, modifiers.shift(), modifiers.command()),
+                    UI_ROW_HEIGHT,
+                    Length::Fill,
+                );
+                let material_cell = if compact_name == item.name {
+                    material_cell
+                } else {
+                    with_tooltip(material_cell, item.name.clone())
+                };
                 row![
-                        selectable_button(
-                            compact_cell_label(&item.name, 20),
-                            self.selected_cells.contains(&(row_index, 0)),
-                            Message::ReportSelect(
-                                row_index,
-                                0,
-                                modifiers.shift(),
-                                modifiers.command(),
-                            ),
-                            UI_ROW_HEIGHT,
-                            Length::Fill,
-                        ),
+                        material_cell,
                         selectable_data_button(
                             lambda_text(item.lambda),
                             self.selected_cells.contains(&(row_index, 1)),
@@ -468,11 +472,13 @@ mod tests {
 
     #[test]
     fn report_uses_black_for_a_matching_black_mtl_material() {
-        let mut report = ReportPage::default();
-        report.entries = vec![MaterialEntry {
-            name: "Black".to_owned(),
-            count: 1,
-        }];
+        let mut report = ReportPage {
+            entries: vec![MaterialEntry {
+                name: "Black".to_owned(),
+                count: 1,
+            }],
+            ..Default::default()
+        };
         report.mtl_materials.insert(
             "black".to_owned(),
             MtlMaterial {

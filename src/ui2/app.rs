@@ -1183,8 +1183,10 @@ mod tests {
 
     #[test]
     fn shared_script_sync_preserves_the_independent_2d_preview() {
-        let mut app = App::default();
-        app.script_text_2d = "r 0 0 2 3 cavity".to_owned();
+        let mut app = App {
+            script_text_2d: "r 0 0 2 3 cavity".to_owned(),
+            ..Default::default()
+        };
         app.turner_2d.sync(&app.script_text_2d);
         let expected_rectangles = app.turner_2d.preview.rects.len();
 
@@ -1214,7 +1216,7 @@ mod tests {
         };
         let mut updated = old.clone();
         updated.thermal_x = 0.2;
-        crate::material_sort::write_mtl_file(&path, &[old.clone()]).unwrap();
+        crate::material_sort::write_mtl_file(&path, std::slice::from_ref(&old)).unwrap();
         crate::material_sort::write_mtl_file(&other_path, &[old]).unwrap();
 
         let source = Some(path.clone());
