@@ -4,8 +4,8 @@ use heat3_povorotnik::transforms::{apply_transform, transform_enable_flags, ENAB
 #[test]
 fn test_enable_flag_permutation_order() {
     let cases = [
-        ("rotate_clockwise", "230145"),
-        ("rotate_counterclockwise", "321045"),
+        ("rotate_clockwise", "231045"),
+        ("rotate_counterclockwise", "320145"),
         ("swap_xy_xz", "014523"),
         ("mirror_xy_x", "013245"),
         ("mirror_xy_y", "102345"),

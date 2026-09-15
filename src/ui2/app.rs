@@ -515,7 +515,11 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::CornerDirection(delta) => {
-            app.corner.direction = ((app.corner.direction as isize + delta).rem_euclid(4)) as usize;
+            let new_direction = ((app.corner.direction as isize + delta).rem_euclid(4)) as usize;
+            if new_direction != app.corner.direction {
+                app.corner.direction = new_direction;
+                app.corner.clear_result();
+            }
         }
         Message::AirApply => {
             if let Some(path) = app.air_cavities.mtl_path.clone() {
@@ -675,20 +679,40 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         },
         Message::CheckTolerance(value) => {
-            app.check.tolerance = value;
-            if let Ok(t) = app.check.tolerance.trim().parse::<f64>() {
-                let clamped = t.clamp(0.1, 100.0);
-                app.check.tolerance = format!("{clamped:.1}");
+            app.check.tolerance = value.clone();
+            match value.trim().parse::<f64>() {
+                Ok(v) if v.is_finite() => {
+                    let clamped = v.clamp(0.1, 100.0);
+                    app.check.tolerance = format!("{clamped:.1}");
+                    app.check.status = None;
+                    app.check.mark_pending();
+                }
+                _ => {
+                    app.check.invalidate_for_invalid_input();
+                    app.check.status = Some((
+                        "Толерантность: введите конечное число 0.1…100".to_owned(),
+                        true,
+                    ));
+                }
             }
-            app.check.mark_pending();
         }
         Message::CheckMaxChange(value) => {
-            app.check.max_change = value;
-            if let Ok(m) = app.check.max_change.trim().parse::<f64>() {
-                let clamped = m.clamp(0.1, 50.0);
-                app.check.max_change = format!("{clamped:.1}");
+            app.check.max_change = value.clone();
+            match value.trim().parse::<f64>() {
+                Ok(v) if v.is_finite() => {
+                    let clamped = v.clamp(0.1, 50.0);
+                    app.check.max_change = format!("{clamped:.1}");
+                    app.check.status = None;
+                    app.check.mark_pending();
+                }
+                _ => {
+                    app.check.invalidate_for_invalid_input();
+                    app.check.status = Some((
+                        "Макс. изменение: введите конечное число 0.1…50".to_owned(),
+                        true,
+                    ));
+                }
             }
-            app.check.mark_pending();
         }
         Message::CheckTick => {
             if let Some(request) = app.check.tick() {
@@ -813,8 +837,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::TurnerProjection(projection) => {
+            app.turner.preview.set_projection(projection);
             app.turner.projection = projection;
-            app.turner.preview.projection = projection;
         }
         Message::TurnerTransform(name) => {
             if app.script_text.is_empty() {
@@ -1176,28 +1200,13 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         Subscription::<Message>::none()
     } else if app.license_manager.snapshot().operation != LicenseOperation::Idle {
         // Active activation/deactivation — poll fast to catch worker completion.
-        Subscription::run(|| {
-            iced::futures::stream::unfold((), |state| async move {
-                std::thread::sleep(Duration::from_millis(80));
-                Some((Message::LicensePoll, state))
-            })
-        })
+        iced::time::every(Duration::from_millis(80)).map(|_| Message::LicensePoll)
     } else {
         // Idle: slow heartbeat only for online-refresh due checks.
-        Subscription::run(|| {
-            iced::futures::stream::unfold((), |state| async move {
-                std::thread::sleep(Duration::from_secs(30));
-                Some((Message::LicensePoll, state))
-            })
-        })
+        iced::time::every(Duration::from_secs(30)).map(|_| Message::LicensePoll)
     };
     let check_tick = if app.check.is_pending() {
-        Subscription::run(|| {
-            iced::futures::stream::unfold((), |state| async move {
-                std::thread::sleep(Duration::from_millis(100));
-                Some((Message::CheckTick, state))
-            })
-        })
+        iced::time::every(Duration::from_millis(100)).map(|_| Message::CheckTick)
     } else {
         Subscription::<Message>::none()
     };

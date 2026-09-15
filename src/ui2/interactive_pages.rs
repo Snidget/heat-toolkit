@@ -138,6 +138,16 @@ impl CheckPage {
         }
     }
 
+    pub fn invalidate_for_invalid_input(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.analysis = None;
+        self.proposals.clear();
+        self.checked.clear();
+        self.collapsed.clear();
+        self.simplified = None;
+        self.analysis_pending_since = None;
+    }
+
     pub fn is_pending(&self) -> bool {
         self.analysis_pending_since.is_some()
     }
@@ -153,12 +163,18 @@ impl CheckPage {
     }
 
     fn analysis_request(&self, include_cavity: bool) -> Option<CheckAnalysisRequest> {
-        let (Ok(tolerance), Ok(max_change)) = (
-            self.tolerance.trim().parse::<f64>(),
-            self.max_change.trim().parse::<f64>(),
-        ) else {
+        let Ok(tolerance) = self.tolerance.trim().parse::<f64>() else {
             return None;
         };
+        let Ok(max_change) = self.max_change.trim().parse::<f64>() else {
+            return None;
+        };
+        if !tolerance.is_finite() || !max_change.is_finite() {
+            return None;
+        }
+        if !(0.1..=100.0).contains(&tolerance) || !(0.1..=50.0).contains(&max_change) {
+            return None;
+        }
         Some(CheckAnalysisRequest {
             generation: self.generation,
             script: self.cached_script.clone(),
@@ -461,7 +477,7 @@ impl TurnerPage {
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center)
                 .into();
-        let element_count = self.preview.rects.len();
+        let element_count = self.preview.segment_count();
         let content = column![
             preview,
             hero_metric(

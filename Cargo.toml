@@ -7,7 +7,7 @@ description = "HEAT3 Поворотник — утилита поворота/о
 default-run = "heat3_povorotnik"
 
 [dependencies]
-iced = { version = "0.14", features = ["wgpu", "canvas"] }
+iced = { version = "0.14", features = ["wgpu", "canvas", "tokio"] }
 arboard = "3.4.0"
 aes-gcm = { version = "0.11.0", features = ["zeroize"] }
 base64 = "0.22.1"

@@ -22,7 +22,7 @@ fn label_sep_re() -> &'static regex::Regex {
     RE.get_or_init(|| regex::Regex::new(r"^(p|b|e)(\s+)(.*)$").unwrap())
 }
 
-fn take_token(input: &str) -> Option<(&str, &str)> {
+pub(crate) fn take_token(input: &str) -> Option<(&str, &str)> {
     let trimmed = input.trim_start();
     if trimmed.is_empty() {
         return None;
@@ -139,6 +139,7 @@ pub fn format_segment(segment: &Segment) -> String {
     format_segment_values(segment).join(" ")
 }
 
+#[allow(dead_code)]
 fn char_substring(s: &str, start: usize, end: usize) -> String {
     s.char_indices()
         .skip(start)
@@ -213,16 +214,8 @@ fn format_original_tail(original_tail: &str, current_trailing: &str) -> String {
 
     let leading_len = original_tail.len() - original_tail.trim_start().len();
     let trailing_len = original_tail.len() - original_tail.trim_end().len();
-    let leading = char_substring(original_tail, 0, leading_len);
-    let trailing = if trailing_len > 0 {
-        char_substring(
-            original_tail,
-            original_tail.chars().count() - trailing_len,
-            original_tail.chars().count(),
-        )
-    } else {
-        String::new()
-    };
+    let leading = &original_tail[..leading_len];
+    let trailing = &original_tail[original_tail.len() - trailing_len..];
     format!("{}{}{}", leading, current_trailing, trailing)
 }
 

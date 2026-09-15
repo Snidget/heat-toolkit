@@ -121,10 +121,10 @@ pub const ENABLE_TRANSFORMS: &[(&str, EnableFn)] = &[
 ];
 
 fn enable_transform_x(mask: &str) -> String {
-    enable_transform([2, 3, 0, 1, 4, 5])(mask)
+    enable_transform([2, 3, 1, 0, 4, 5])(mask)
 }
 fn enable_transform_ccw(mask: &str) -> String {
-    enable_transform([3, 2, 1, 0, 4, 5])(mask)
+    enable_transform([3, 2, 0, 1, 4, 5])(mask)
 }
 fn enable_transform_swap(mask: &str) -> String {
     enable_transform([0, 1, 4, 5, 2, 3])(mask)

@@ -149,6 +149,20 @@ impl Preview2D {
         self.cache.clear();
     }
 
+    pub fn set_projection(&mut self, projection: Projection) {
+        if self.projection != projection {
+            self.projection = projection;
+            self.cache.clear();
+        }
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.lines
+            .iter()
+            .filter(|line| line.segment.is_some())
+            .count()
+    }
+
     pub fn view(&self) -> iced::Element<'_, CanvasMessage> {
         canvas::Canvas::new(self)
             .width(iced::Length::Fixed(theme::TURNER_PREVIEW_SIZE))
@@ -302,7 +316,7 @@ impl Program<CanvasMessage> for Preview2D {
                     &path,
                     Stroke::default()
                         .with_color(if state.hovered == Some(i) {
-                            theme::ACCENT
+                            theme::accent(dark)
                         } else {
                             theme::ink(dark)
                         })
