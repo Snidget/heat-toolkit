@@ -63,16 +63,27 @@ impl CavityCheckResult {
     }
 }
 
-fn normalize_plane(value: f64) -> String {
-    // Python: f"{value:.10g}" с обнулением значений < 1e-12
-    let v = if value.abs() < 1e-12 { 0.0 } else { value };
+fn canonical_plane(value: f64) -> f64 {
+    if value == 0.0 {
+        0.0
+    } else {
+        value
+    }
+}
+
+fn plane_key(value: f64) -> u64 {
+    canonical_plane(value).to_bits()
+}
+
+fn format_plane_display(value: f64) -> String {
+    let v = canonical_plane(value);
     crate::text::format_g(v, 10)
 }
 
 pub fn count_model_planes(script_text: &str) -> PlaneUsage {
-    let mut x_planes: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut y_planes: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut z_planes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut x_planes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut y_planes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut z_planes: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut total_objects = 0usize;
 
     for line in parse_script(script_text) {
@@ -82,12 +93,12 @@ pub fn count_model_planes(script_text: &str) -> PlaneUsage {
         };
         total_objects += 1;
         let [x1, y1, z1, x2, y2, z2] = segment.as_tuple();
-        x_planes.insert(normalize_plane(x1));
-        x_planes.insert(normalize_plane(x2));
-        y_planes.insert(normalize_plane(y1));
-        y_planes.insert(normalize_plane(y2));
-        z_planes.insert(normalize_plane(z1));
-        z_planes.insert(normalize_plane(z2));
+        x_planes.insert(plane_key(x1));
+        x_planes.insert(plane_key(x2));
+        y_planes.insert(plane_key(y1));
+        y_planes.insert(plane_key(y2));
+        z_planes.insert(plane_key(z1));
+        z_planes.insert(plane_key(z2));
     }
 
     PlaneUsage {
@@ -161,7 +172,7 @@ fn collect_cavity_geometry(script_text: &str) -> CavityGeometry {
 }
 
 fn unique_sorted_coords(boxes: &[Box3D], axis: char) -> Vec<f64> {
-    let mut values_by_key: HashMap<String, f64> = HashMap::new();
+    let mut values_by_key: HashMap<u64, f64> = HashMap::new();
     for box_ in boxes {
         let (a, b) = match axis {
             'x' => (box_.x1, box_.x2),
@@ -169,11 +180,13 @@ fn unique_sorted_coords(boxes: &[Box3D], axis: char) -> Vec<f64> {
             'z' => (box_.z1, box_.z2),
             _ => (0.0, 0.0),
         };
-        values_by_key.insert(normalize_plane(a), a);
-        values_by_key.insert(normalize_plane(b), b);
+        let ca = canonical_plane(a);
+        let cb = canonical_plane(b);
+        values_by_key.insert(ca.to_bits(), ca);
+        values_by_key.insert(cb.to_bits(), cb);
     }
     let mut vals: Vec<f64> = values_by_key.into_values().collect();
-    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    vals.sort_by(|a, b| a.total_cmp(b));
     vals
 }
 
@@ -250,30 +263,30 @@ pub fn detect_internal_cavities(script_text: &str, cell_limit: usize) -> CavityC
         };
     }
 
-    let x_index: HashMap<String, usize> = x_coords
+    let x_index: HashMap<u64, usize> = x_coords
         .iter()
         .enumerate()
-        .map(|(i, v)| (normalize_plane(*v), i))
+        .map(|(i, v)| (plane_key(*v), i))
         .collect();
-    let y_index: HashMap<String, usize> = y_coords
+    let y_index: HashMap<u64, usize> = y_coords
         .iter()
         .enumerate()
-        .map(|(i, v)| (normalize_plane(*v), i))
+        .map(|(i, v)| (plane_key(*v), i))
         .collect();
-    let z_index: HashMap<String, usize> = z_coords
+    let z_index: HashMap<u64, usize> = z_coords
         .iter()
         .enumerate()
-        .map(|(i, v)| (normalize_plane(*v), i))
+        .map(|(i, v)| (plane_key(*v), i))
         .collect();
     let mut occupied = vec![0u8; cell_count];
 
     for (is_material, box_) in &geometry.occupancy_operations {
-        let ix1 = x_index[&normalize_plane(box_.x1)];
-        let ix2 = x_index[&normalize_plane(box_.x2)];
-        let iy1 = y_index[&normalize_plane(box_.y1)];
-        let iy2 = y_index[&normalize_plane(box_.y2)];
-        let iz1 = z_index[&normalize_plane(box_.z1)];
-        let iz2 = z_index[&normalize_plane(box_.z2)];
+        let ix1 = x_index[&plane_key(box_.x1)];
+        let ix2 = x_index[&plane_key(box_.x2)];
+        let iy1 = y_index[&plane_key(box_.y1)];
+        let iy2 = y_index[&plane_key(box_.y2)];
+        let iz1 = z_index[&plane_key(box_.z1)];
+        let iz2 = z_index[&plane_key(box_.z2)];
         for ix in ix1..ix2 {
             for iy in iy1..iy2 {
                 let base = (ix * ny + iy) * nz;
@@ -381,7 +394,7 @@ pub fn detect_internal_cavities(script_text: &str, cell_limit: usize) -> CavityC
 }
 
 fn format_coord(value: f64) -> String {
-    normalize_plane(value)
+    format_plane_display(value)
 }
 
 pub fn format_cavity_check(result: &CavityCheckResult) -> String {
@@ -621,8 +634,9 @@ fn collect_merge_proposals(
         if let Some(seg) = &line.segment {
             let (v1, v2) = axis_vals(seg, axis);
             for v in [v1, v2] {
-                if seen.insert(v.to_bits()) {
-                    sorted_coords.push(v);
+                let cv = canonical_plane(v);
+                if seen.insert(cv.to_bits()) {
+                    sorted_coords.push(cv);
                 }
             }
         }
@@ -781,8 +795,9 @@ fn simplify_axis(lines: &mut [ScriptLine], axis: usize, tolerance: f64, max_chan
         if let Some(seg) = &line.segment {
             let (v1, v2) = axis_vals(seg, axis);
             for v in [v1, v2] {
-                if seen.insert(v.to_bits()) {
-                    unique.push(v);
+                let cv = canonical_plane(v);
+                if seen.insert(cv.to_bits()) {
+                    unique.push(cv);
                 }
             }
         }

@@ -78,17 +78,38 @@ fn split_line_ending(text: &str) -> (String, String) {
 fn material_name_from_raw_line(raw_line: &str) -> Option<String> {
     let (line_text, _) = split_line_ending(raw_line);
     let line = parse_line(&line_text);
-    let label = line.label.as_deref()?;
-    let _ = line.segment?;
-    if label != "p" {
+    if line.label.as_deref() == Some("p") {
+        if line.segment.is_some() {
+            let material_name = material_name_text_from_trailing(&line.trailing);
+            if !material_name.is_empty() {
+                return Some(material_name);
+            }
+            return None;
+        }
         return None;
     }
-    let material_name = material_name_text_from_trailing(&line.trailing);
-    if material_name.is_empty() {
-        None
-    } else {
-        Some(material_name)
+    // Official HEAT3 also defines `s x1 y1 z1 dx dy dz material` as a material box.
+    // It is not yet parsed by `parse_script` into a segment, so handle its trailing
+    // material name directly from the raw text.
+    let trimmed = line_text.trim_start();
+    if trimmed.starts_with("s ") || trimmed.starts_with("s\t") {
+        let after_s = trimmed[1..].trim_start();
+        let mut remainder = after_s;
+        for _ in 0..6 {
+            let (token, after) = crate::parser::take_token(remainder)?;
+            // Ensure the token is a finite number; otherwise this is not a valid `s` box.
+            if token.parse::<f64>().map(|v| !v.is_finite()).unwrap_or(true) {
+                return None;
+            }
+            remainder = after;
+        }
+        let material_name = material_name_text_from_trailing(remainder);
+        if material_name.is_empty() {
+            return None;
+        }
+        return Some(material_name);
     }
+    None
 }
 
 pub fn extract_material_entries(script_text: &str) -> Vec<MaterialEntry> {

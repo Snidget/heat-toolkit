@@ -171,7 +171,13 @@ impl Camera {
 }
 
 /// Центр и радиус сцены по всем сегментам.
+#[allow(dead_code)]
 fn scene_bounds(lines: &[ScriptLine]) -> Option<([f64; 3], f64)> {
+    world_aabb(lines).map(|(_min, _max, center, radius)| (center, radius))
+}
+
+#[allow(clippy::type_complexity)]
+fn world_aabb(lines: &[ScriptLine]) -> Option<([f64; 3], [f64; 3], [f64; 3], f64)> {
     let mut min = [f64::INFINITY; 3];
     let mut max = [f64::NEG_INFINITY; 3];
     let mut any = false;
@@ -197,7 +203,7 @@ fn scene_bounds(lines: &[ScriptLine]) -> Option<([f64; 3], f64)> {
     for i in 0..3 {
         radius = radius.max(max[i] - min[i]);
     }
-    Some((center, (radius * 0.5).max(1e-6)))
+    Some((min, max, center, (radius * 0.5).max(1e-6)))
 }
 
 fn build_camera(
@@ -206,7 +212,7 @@ fn build_camera(
     elevation: f64,
     bounds: Rectangle,
 ) -> Option<(Camera, [f64; 3], f64)> {
-    let (center, radius) = scene_bounds(lines)?;
+    let (min, max, center, radius) = world_aabb(lines)?;
     let el = elevation.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
     let dir = (el.cos() * azimuth.sin(), el.sin(), el.cos() * azimuth.cos());
 
@@ -227,13 +233,39 @@ fn build_camera(
     };
     let (ux, uy, uz) = cross((rx, ry, rz), (fx, fy, fz));
 
+    // Projection-aware fit: evaluate 8 AABB corners in camera right/up basis.
+    let mut max_vx: f64 = 0.0;
+    let mut max_vy: f64 = 0.0;
+    let mut max_vz: f64 = 0.0;
+    for &x in &[min[0], max[0]] {
+        for &y in &[min[1], max[1]] {
+            for &z in &[min[2], max[2]] {
+                let dx = x - center[0];
+                let dy = y - center[1];
+                let dz = z - center[2];
+                let vx = (dx * rx + dy * ry + dz * rz).abs();
+                let vy = (dx * ux + dy * uy + dz * uz).abs();
+                let vz = (dx * fx + dy * fy + dz * fz).abs();
+                max_vx = max_vx.max(vx);
+                max_vy = max_vy.max(vy);
+                max_vz = max_vz.max(vz);
+            }
+        }
+    }
     let w = bounds.width.max(1.0) as f64;
     let h = bounds.height.max(1.0) as f64;
     let aspect = w / h;
-    let half_h = (radius / aspect).max(radius) * 1.15;
-    let half_w = half_h * aspect;
-    let near = (dist - radius * 3.0).max(0.1);
-    let far = dist + radius * 3.0;
+    let mut half_h_needed = max_vy.max(max_vx / aspect);
+    let mut half_w_needed = half_h_needed * aspect;
+    // Fallback for degenerate bounds already handled by radius, but keep epsilon.
+    half_h_needed = half_h_needed.max(1e-6);
+    half_w_needed = half_w_needed.max(1e-6);
+    let margin = 1.15;
+    let half_h = half_h_needed * margin;
+    let half_w = half_w_needed * margin;
+    let half_depth = max_vz.max(radius * 0.5).max(1e-6);
+    let near = (dist - half_depth * 1.5 - 1.0).max(0.1);
+    let far = dist + half_depth * 1.5 + 1.0;
 
     Some((
         Camera {

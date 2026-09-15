@@ -294,11 +294,17 @@ impl CornerPage {
         self.material_colors = colors;
     }
 
+    pub fn clear_result(&mut self) {
+        self.result = None;
+        self.result_lines.clear();
+    }
+
     pub fn sync_script(&mut self, script: &str) {
         self.lines = crate::parser::parse_script(script);
         if self.cached_script != script {
             self.cached_script = script.to_owned();
             self.cached_pair = crate::corner::detect_constant_pair(script);
+            self.clear_result();
         }
     }
 

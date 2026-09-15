@@ -39,7 +39,10 @@ impl Default for Step3DPage {
 impl Step3DPage {
     pub fn sync_lines(&mut self, script: &str) {
         let lines = parse_script(script);
-        self.boxes = lines.iter().filter(|line| line.segment.is_some()).count();
+        self.boxes = lines
+            .iter()
+            .filter(|line| line.label.as_deref() == Some("p") && line.segment.is_some())
+            .count();
         self.lines = lines;
     }
 
@@ -142,12 +145,13 @@ impl Step3DPage {
 pub fn count_boxes(script: &str) -> usize {
     parse_script(script)
         .iter()
-        .filter(|line| line.segment.is_some())
+        .filter(|line| line.label.as_deref() == Some("p") && line.segment.is_some())
         .count()
 }
 pub fn export_script(script: &str) -> Result<String, String> {
     let boxes = parse_script(script)
         .iter()
+        .filter(|line| line.label.as_deref() == Some("p"))
         .filter_map(|line| line.segment.map(|segment| segment.as_tuple()))
         .collect::<Vec<_>>();
     if boxes.is_empty() {

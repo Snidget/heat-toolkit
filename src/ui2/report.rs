@@ -106,11 +106,23 @@ impl ReportPage {
         if self.cached_script == script {
             return;
         }
+        let old_entries = self.entries.clone();
         self.cached_script = script.to_owned();
         self.entries = extract_material_entries(script);
         self.refresh_items();
-        self.selected_cells
-            .retain(|(row, column)| *row < self.entries.len() && *column < 2);
+        // If material row identity/order changed, selection by row index would retarget to a different material.
+        if old_entries != self.entries {
+            self.selected_cells.clear();
+            self.selection_anchor = None;
+        } else {
+            self.selected_cells
+                .retain(|(row, column)| *row < self.entries.len() && *column < 2);
+            if let Some((row, column)) = self.selection_anchor {
+                if row >= self.entries.len() || column >= 2 {
+                    self.selection_anchor = None;
+                }
+            }
+        }
     }
 
     fn build_items(&self) -> Vec<ReportItem> {
@@ -135,6 +147,11 @@ impl ReportPage {
         self.items = self.build_items();
         self.selected_cells
             .retain(|(row, column)| *row < self.items.len() && *column < 2);
+        if let Some((row, column)) = self.selection_anchor {
+            if row >= self.items.len() || column >= 2 {
+                self.selection_anchor = None;
+            }
+        }
     }
 
     /// Цвета материалов MTL для 3D-страниц (аналог egui mod.rs material_color_map).
