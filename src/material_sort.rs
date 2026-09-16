@@ -187,6 +187,50 @@ pub fn sort_material_boxes_by_order(script_text: &str, material_order: &[String]
         .collect()
 }
 
+pub fn is_material_reorder_safe(script: &str) -> bool {
+    let lines = crate::parser::parse_script(script);
+    let p_segments: Vec<crate::models::Segment> = lines
+        .iter()
+        .filter(|l| l.label.as_deref() == Some("p"))
+        .filter_map(|l| l.segment)
+        .collect();
+    let e_segments: Vec<crate::models::Segment> = lines
+        .iter()
+        .filter(|l| l.label.as_deref() == Some("e"))
+        .filter_map(|l| l.segment)
+        .collect();
+    for i in 0..p_segments.len() {
+        for j in (i + 1)..p_segments.len() {
+            if boxes_overlap(&p_segments[i], &p_segments[j]) {
+                return false;
+            }
+        }
+    }
+    for p in &p_segments {
+        for e in &e_segments {
+            if boxes_overlap(p, e) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn boxes_overlap(a: &crate::models::Segment, b: &crate::models::Segment) -> bool {
+    let [ax1, ay1, az1, ax2, ay2, az2] = a.as_tuple();
+    let [bx1, by1, bz1, bx2, by2, bz2] = b.as_tuple();
+    let (ax_min, ax_max) = (ax1.min(ax2), ax1.max(ax2));
+    let (ay_min, ay_max) = (ay1.min(ay2), ay1.max(ay2));
+    let (az_min, az_max) = (az1.min(az2), az1.max(az2));
+    let (bx_min, bx_max) = (bx1.min(bx2), bx1.max(bx2));
+    let (by_min, by_max) = (by1.min(by2), by1.max(by2));
+    let (bz_min, bz_max) = (bz1.min(bz2), bz1.max(bz2));
+    const EPS: f64 = 1e-9;
+    (ax_max.min(bx_max) - ax_min.max(bx_min) > EPS)
+        && (ay_max.min(by_max) - ay_min.max(by_min) > EPS)
+        && (az_max.min(bz_max) - az_min.max(bz_min) > EPS)
+}
+
 fn decode_text(raw: &[u8], encoding: &str) -> String {
     let decoded = if encoding == NAME_ENCODING {
         let (text, _) = WINDOWS_1251.decode_without_bom_handling(raw);
@@ -493,6 +537,53 @@ pub fn materials_by_normalized_name(materials: &[MtlMaterial]) -> HashMap<String
         .iter()
         .map(|m| (normalize_material_name(&m.name), m.clone()))
         .collect()
+}
+
+/// Compares all material properties that affect conductivity sorting, report
+/// values and preview colors, ignoring the display-name spelling.
+fn same_material_data(a: &MtlMaterial, b: &MtlMaterial) -> bool {
+    a.thermal_x == b.thermal_x
+        && a.thermal_y == b.thermal_y
+        && a.volume_heat == b.volume_heat
+        && a.rgb_r == b.rgb_r
+        && a.rgb_g == b.rgb_g
+        && a.rgb_b == b.rgb_b
+        && a.special_value == b.special_value
+}
+
+/// Builds the normalized-name map while rejecting ambiguous duplicates.
+///
+/// Two records that normalize to the same name are only accepted when every
+/// numeric/color property is identical (the first spelling wins for display).
+/// Conflicting records would otherwise be silently resolved by file order
+/// (last record wins).
+pub fn materials_by_normalized_name_checked(
+    materials: &[MtlMaterial],
+) -> Result<HashMap<String, MtlMaterial>, String> {
+    let mut map: HashMap<String, MtlMaterial> = HashMap::new();
+    let mut conflicts: Vec<String> = Vec::new();
+    for material in materials {
+        let key = normalize_material_name(&material.name);
+        match map.get(&key) {
+            Some(existing) if !same_material_data(existing, material) => {
+                if !conflicts.contains(&material.name) {
+                    conflicts.push(material.name.clone());
+                }
+            }
+            Some(_) => {}
+            None => {
+                map.insert(key, material.clone());
+            }
+        }
+    }
+    if conflicts.is_empty() {
+        Ok(map)
+    } else {
+        Err(format!(
+            "MTL содержит конфликтующие дубликаты материалов: {}.",
+            conflicts.join(", ")
+        ))
+    }
 }
 
 pub fn sort_material_names_by_conductivity(

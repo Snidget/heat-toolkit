@@ -56,6 +56,7 @@ pub enum Message {
     CloseSettings,
     SettingsTheme(AppTheme),
     SettingsGrid(bool),
+    SystemThemeTick,
     ModalBackdrop,
     CanvasHover,
     ReportSelect(usize, usize, bool, bool),
@@ -99,6 +100,8 @@ pub enum Message {
     AirCloseColor,
     AirHatch(u8),
     AirApply,
+    AirConfirmApply,
+    AirCancelApply,
     CheckPaste,
     CheckTolerance(String),
     CheckMaxChange(String),
@@ -147,6 +150,7 @@ pub struct App {
     script_text: String,
     script_text_2d: String,
     modifiers: iced::keyboard::Modifiers,
+    last_system_dark: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -194,6 +198,7 @@ impl Default for App {
             script_text: String::new(),
             script_text_2d: String::new(),
             modifiers: iced::keyboard::Modifiers::default(),
+            last_system_dark: None,
         }
     }
 }
@@ -242,7 +247,7 @@ fn reload_material_cache(
         return Ok(false);
     }
     let materials = crate::material_sort::parse_mtl_file(mutated_path, true)?;
-    *cache = crate::material_sort::materials_by_normalized_name(&materials);
+    *cache = crate::material_sort::materials_by_normalized_name_checked(&materials)?;
     Ok(true)
 }
 
@@ -293,12 +298,31 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::CloseSettings => app.show_settings = false,
         Message::SettingsTheme(theme_mode) => {
             app.theme_mode = theme_mode;
+            if theme_mode == AppTheme::System {
+                app.last_system_dark = Some(super::platform::windows_dark_mode());
+            } else {
+                app.last_system_dark = None;
+            }
             super::platform::apply_titlebar_theme(is_dark(app));
+            // Theme change affects canvas colors; invalidate preview caches.
+            app.turner.preview.cache.clear();
+            app.turner_2d.preview.cache.clear();
         }
         Message::SettingsGrid(show) => {
             app.show_grid = show;
             app.turner.preview.cache.clear();
             app.turner_2d.preview.cache.clear();
+        }
+        Message::SystemThemeTick => {
+            if app.theme_mode == AppTheme::System {
+                let dark = super::platform::windows_dark_mode();
+                if app.last_system_dark != Some(dark) {
+                    app.last_system_dark = Some(dark);
+                    super::platform::apply_titlebar_theme(dark);
+                    app.turner.preview.cache.clear();
+                    app.turner_2d.preview.cache.clear();
+                }
+            }
         }
         Message::ModalBackdrop => {}
         Message::CanvasHover => {}
@@ -328,11 +352,12 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 .add_filter("Material files", &["mtl", "MTL"])
                 .pick_file()
             {
-                match crate::material_sort::parse_mtl_file(&path, true) {
-                    Ok(materials) => {
-                        let count = materials.len();
-                        app.report.mtl_materials =
-                            crate::material_sort::materials_by_normalized_name(&materials);
+                match crate::material_sort::parse_mtl_file(&path, true).and_then(|materials| {
+                    crate::material_sort::materials_by_normalized_name_checked(&materials)
+                        .map(|map| (map, materials.len()))
+                }) {
+                    Ok((map, count)) => {
+                        app.report.mtl_materials = map;
                         app.report.mtl_path = Some(path.clone());
                         app.report.refresh_items();
                         let colors = app.report.material_color_map();
@@ -357,11 +382,11 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::ModifiersChanged(modifiers) => app.modifiers = modifiers,
-        Message::LicenseKeyChanged(value) => app.license.key = value,
+        Message::LicenseKeyChanged(value) => app.license.set_key(value),
         Message::LicenseToggleReveal => app.license.reveal_key = !app.license.reveal_key,
         Message::LicensePaste => {
             if let Ok(value) = crate::clipboard::read_text() {
-                app.license.key = value.trim().to_owned();
+                app.license.set_key(value.trim().to_owned());
             }
         }
         Message::LicenseActivate => {
@@ -400,24 +425,18 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 .add_filter("Material files", &["mtl", "MTL"])
                 .pick_file()
             {
-                match crate::material_sort::parse_mtl_file(&path, true) {
-                    Ok(materials) => {
-                        let mut map = std::collections::HashMap::new();
-                        for material in &materials {
-                            map.insert(
-                                crate::material_sort::normalize_material_name(&material.name),
-                                material.clone(),
-                            );
-                        }
+                match crate::material_sort::parse_mtl_file(&path, true).and_then(|materials| {
+                    crate::material_sort::materials_by_normalized_name_checked(&materials)
+                        .map(|map| (map, materials.len()))
+                }) {
+                    Ok((map, count)) => {
                         app.material_sort.mtl_materials = map;
                         app.material_sort.mtl_path = Some(path.clone());
                         let colors = app.material_sort.color_map();
                         app.step_3d.set_material_colors(colors.clone());
                         app.corner.set_material_colors(colors);
-                        app.material_sort.status = Some((
-                            format!("Материалов загружено из MTL: {}.", materials.len()),
-                            false,
-                        ));
+                        app.material_sort.status =
+                            Some((format!("Материалов загружено из MTL: {count}."), false));
                     }
                     Err(error) => {
                         app.material_sort.status = Some((format!("Ошибка MTL: {error}"), true));
@@ -431,13 +450,24 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 &mut app.material_sort.names,
                 &app.material_sort.mtl_materials,
             );
-            app.script_text =
+            let new_script =
                 super::static_pages::reorder_script(&app.script_text, &app.material_sort.names);
-            task = sync_script_fields(app);
-            app.material_sort.status = Some((
-                "Материалы отсортированы по теплопроводности.".to_owned(),
-                false,
-            ));
+            if new_script != app.script_text
+                && !crate::material_sort::is_material_reorder_safe(&app.script_text)
+            {
+                app.material_sort.status = Some((
+                    "Сортировка заблокирована: перекрывающиеся боксы — изменение порядка изменит геометрию. Порядок оставлен без изменений."
+                        .to_owned(),
+                    true,
+                ));
+            } else {
+                app.script_text = new_script;
+                task = sync_script_fields(app);
+                app.material_sort.status = Some((
+                    "Материалы отсортированы по теплопроводности.".to_owned(),
+                    false,
+                ));
+            }
         }
         Message::MaterialCopy => {
             if app.script_text.is_empty() {
@@ -457,10 +487,24 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::MaterialMove(index, delta) => {
             app.material_sort.move_item(index, delta);
-            app.script_text =
+            let new_script =
                 super::static_pages::reorder_script(&app.script_text, &app.material_sort.names);
-            task = sync_script_fields(app);
-            app.material_sort.status = Some(("Порядок материалов изменён.".to_owned(), false));
+            if new_script != app.script_text
+                && !crate::material_sort::is_material_reorder_safe(&app.script_text)
+            {
+                // revert move
+                app.material_sort
+                    .move_item((index as isize + delta) as usize, -delta);
+                app.material_sort.status = Some((
+                    "Перемещение заблокировано: перекрывающиеся боксы — изменение порядка изменит геометрию."
+                        .to_owned(),
+                    true,
+                ));
+            } else {
+                app.script_text = new_script;
+                task = sync_script_fields(app);
+                app.material_sort.status = Some(("Порядок материалов изменён.".to_owned(), false));
+            }
         }
         Message::CornerPaste => match crate::clipboard::read_text() {
             Ok(text) if text.trim().is_empty() => {
@@ -522,86 +566,40 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::AirApply => {
-            if let Some(path) = app.air_cavities.mtl_path.clone() {
-                match super::static_pages::apply_air_cavity_upsert(
+            if app.air_cavities.mtl_path.is_none() {
+                app.air_cavities.status = Some(("Файл MTL не выбран.".to_owned(), true));
+            } else if let Some(path) = app.air_cavities.mtl_path.clone() {
+                match crate::air_cavities::preflight_air_cavity_upsert(
                     path.as_path(),
-                    &app.air_cavities,
+                    &app.air_cavities.specs,
                 ) {
-                    Ok(result) => {
-                        let report_reload = reload_material_cache(
-                            app.report.mtl_path.as_ref(),
-                            &mut app.report.mtl_materials,
-                            path.as_path(),
-                        );
-                        let material_reload = reload_material_cache(
-                            app.material_sort.mtl_path.as_ref(),
-                            &mut app.material_sort.mtl_materials,
-                            path.as_path(),
-                        );
-                        let mut reload_errors = Vec::new();
-                        let mut refreshed_colors = None;
-                        match report_reload {
-                            Ok(true) => {
-                                app.report.refresh_items();
-                                refreshed_colors = Some(app.report.material_color_map());
-                            }
-                            Ok(false) => {}
-                            Err(error) => {
-                                app.report.mtl_materials.clear();
-                                app.report.refresh_items();
-                                app.report.status = Some((
-                                    format!("MTL требуется открыть повторно: {error}"),
-                                    true,
-                                ));
-                                reload_errors.push("шкала".to_owned());
-                            }
-                        }
-                        match material_reload {
-                            Ok(true) => {
-                                refreshed_colors
-                                    .get_or_insert_with(|| app.material_sort.color_map());
-                            }
-                            Ok(false) => {}
-                            Err(error) => {
-                                app.material_sort.mtl_materials.clear();
-                                app.material_sort.status = Some((
-                                    format!("MTL требуется открыть повторно: {error}"),
-                                    true,
-                                ));
-                                reload_errors.push("сортировка".to_owned());
-                            }
-                        }
-                        if reload_errors.is_empty() {
-                            if let Some(colors) = refreshed_colors {
-                                app.step_3d.set_material_colors(colors.clone());
-                                app.corner.set_material_colors(colors);
-                            }
-                        } else {
-                            app.step_3d.set_material_colors(HashMap::new());
-                            app.corner.set_material_colors(HashMap::new());
-                        }
-                        let status = format!(
-                            "Готово. Обновлено: {}, добавлено: {}",
-                            result.updated_count(),
-                            result.added_count()
-                        );
+                    Ok(preflight) if preflight.has_replacements() => {
+                        app.air_cavities.pending_replacements = Some(preflight.replaced.clone());
                         app.air_cavities.status = Some((
-                            if reload_errors.is_empty() {
-                                status
-                            } else {
-                                format!(
-                                    "{status}. Не удалось обновить: {}.",
-                                    reload_errors.join(", ")
-                                )
-                            },
-                            !reload_errors.is_empty(),
+                            format!(
+                                "Внимание: будут перезаписаны существующие материалы: {}.",
+                                preflight.replaced.join(", ")
+                            ),
+                            true,
                         ));
+                    }
+                    Ok(_) => {
+                        app.air_cavities.pending_replacements = None;
+                        apply_air_cavity_upsert(app);
                     }
                     Err(error) => {
                         app.air_cavities.status = Some((format!("Ошибка: {error}"), true));
                     }
                 }
             }
+        }
+        Message::AirCancelApply => {
+            app.air_cavities.pending_replacements = None;
+            app.air_cavities.status = Some(("Запись отменена.".to_owned(), false));
+        }
+        Message::AirConfirmApply => {
+            app.air_cavities.pending_replacements = None;
+            apply_air_cavity_upsert(app);
         }
         Message::AirOpen => {
             if let Some(path) = rfd::FileDialog::new()
@@ -843,17 +841,29 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::TurnerTransform(name) => {
             if app.script_text.is_empty() {
                 app.turner.status = Some(("Нет данных для преобразования.".to_owned(), true));
-            } else if let Some(result) =
-                super::interactive_pages::transform_script(&app.script_text, name)
-            {
-                app.script_text = result;
-                task = sync_script_fields(app);
-                app.turner.status = Some(("Преобразование выполнено.".to_owned(), false));
             } else {
-                app.turner.status = Some((
-                    "В скрипте не найдены геометрические элементы.".to_owned(),
-                    true,
-                ));
+                let unsupported =
+                    crate::transforms::unsupported_geometry_commands(&app.script_text);
+                if !unsupported.is_empty() {
+                    app.turner.status = Some((
+                        format!(
+                            "Преобразование отменено: скрипт содержит неподдерживаемые геометрические команды ({}). Такие команды остались бы в старых координатах.",
+                            unsupported.join(", ")
+                        ),
+                        true,
+                    ));
+                } else if let Some(result) =
+                    super::interactive_pages::transform_script(&app.script_text, name)
+                {
+                    app.script_text = result;
+                    task = sync_script_fields(app);
+                    app.turner.status = Some(("Преобразование выполнено.".to_owned(), false));
+                } else {
+                    app.turner.status = Some((
+                        "В скрипте не найдены геометрические элементы.".to_owned(),
+                        true,
+                    ));
+                }
             }
         }
         Message::TurnerInstruction => app.turner.show_instruction = !app.turner.show_instruction,
@@ -894,15 +904,27 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::Turner2DTransform(name) => {
             if app.script_text_2d.is_empty() {
                 app.turner_2d.status = Some(("Нет данных для преобразования.".to_owned(), true));
-            } else if let Some(result) =
-                super::interactive_pages::transform_2d(&app.script_text_2d, name)
-            {
-                app.script_text_2d = result;
-                app.turner_2d.sync(&app.script_text_2d);
-                app.turner_2d.status = Some(("Преобразование выполнено.".to_owned(), false));
             } else {
-                app.turner_2d.status =
-                    Some(("Не удалось выполнить преобразование.".to_owned(), true));
+                let unsupported =
+                    crate::turner2d::unsupported_geometry_commands(&app.script_text_2d);
+                if !unsupported.is_empty() {
+                    app.turner_2d.status = Some((
+                        format!(
+                            "Преобразование отменено: 2D-скрипт содержит неподдерживаемые пространственные команды ({}). Они остались бы в старых координатах.",
+                            unsupported.join(", ")
+                        ),
+                        true,
+                    ));
+                } else if let Some(result) =
+                    super::interactive_pages::transform_2d(&app.script_text_2d, name)
+                {
+                    app.script_text_2d = result;
+                    app.turner_2d.sync(&app.script_text_2d);
+                    app.turner_2d.status = Some(("Преобразование выполнено.".to_owned(), false));
+                } else {
+                    app.turner_2d.status =
+                        Some(("Не удалось выполнить преобразование.".to_owned(), true));
+                }
             }
         }
         Message::StepPaste => match crate::clipboard::read_text() {
@@ -942,6 +964,86 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::WindowOpened => super::platform::apply_titlebar_theme(is_dark(app)),
     }
     task
+}
+
+/// Writes the generated Air Cavities materials into the selected MTL and
+/// refreshes every derived cache. Callers must have already confirmed any
+/// intentional overwrite of existing materials.
+fn apply_air_cavity_upsert(app: &mut App) {
+    let Some(path) = app.air_cavities.mtl_path.clone() else {
+        app.air_cavities.status = Some(("Файл MTL не выбран.".to_owned(), true));
+        return;
+    };
+    match super::static_pages::apply_air_cavity_upsert(path.as_path(), &app.air_cavities) {
+        Ok(result) => {
+            let report_reload = reload_material_cache(
+                app.report.mtl_path.as_ref(),
+                &mut app.report.mtl_materials,
+                path.as_path(),
+            );
+            let material_reload = reload_material_cache(
+                app.material_sort.mtl_path.as_ref(),
+                &mut app.material_sort.mtl_materials,
+                path.as_path(),
+            );
+            let mut reload_errors = Vec::new();
+            let mut refreshed_colors = None;
+            match report_reload {
+                Ok(true) => {
+                    app.report.refresh_items();
+                    refreshed_colors = Some(app.report.material_color_map());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    app.report.mtl_materials.clear();
+                    app.report.refresh_items();
+                    app.report.status =
+                        Some((format!("MTL требуется открыть повторно: {error}"), true));
+                    reload_errors.push("шкала".to_owned());
+                }
+            }
+            match material_reload {
+                Ok(true) => {
+                    refreshed_colors.get_or_insert_with(|| app.material_sort.color_map());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    app.material_sort.mtl_materials.clear();
+                    app.material_sort.status =
+                        Some((format!("MTL требуется открыть повторно: {error}"), true));
+                    reload_errors.push("сортировка".to_owned());
+                }
+            }
+            if reload_errors.is_empty() {
+                if let Some(colors) = refreshed_colors {
+                    app.step_3d.set_material_colors(colors.clone());
+                    app.corner.set_material_colors(colors);
+                }
+            } else {
+                app.step_3d.set_material_colors(HashMap::new());
+                app.corner.set_material_colors(HashMap::new());
+            }
+            let status = format!(
+                "Готово. Обновлено: {}, добавлено: {}",
+                result.updated_count(),
+                result.added_count()
+            );
+            app.air_cavities.status = Some((
+                if reload_errors.is_empty() {
+                    status
+                } else {
+                    format!(
+                        "{status}. Не удалось обновить: {}.",
+                        reload_errors.join(", ")
+                    )
+                },
+                !reload_errors.is_empty(),
+            ));
+        }
+        Err(error) => {
+            app.air_cavities.status = Some((format!("Ошибка: {error}"), true));
+        }
+    }
 }
 
 pub fn view(app: &App) -> Element<'_, Message> {
@@ -1210,6 +1312,11 @@ pub fn subscription(app: &App) -> Subscription<Message> {
     } else {
         Subscription::<Message>::none()
     };
+    let system_theme_poll = if app.theme_mode == AppTheme::System {
+        iced::time::every(Duration::from_secs(1)).map(|_| Message::SystemThemeTick)
+    } else {
+        Subscription::<Message>::none()
+    };
     let keyboard_events = iced::event::listen_with(|event, _status, _window| match event {
         iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
             Some(Message::ModifiersChanged(modifiers))
@@ -1221,7 +1328,13 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         }) if modifiers.command() => Some(Message::ReportCopyShortcut),
         _ => None,
     });
-    Subscription::batch([window_events, license_poll, check_tick, keyboard_events])
+    Subscription::batch([
+        window_events,
+        license_poll,
+        check_tick,
+        system_theme_poll,
+        keyboard_events,
+    ])
 }
 
 #[cfg(test)]

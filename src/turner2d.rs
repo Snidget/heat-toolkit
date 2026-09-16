@@ -24,6 +24,26 @@ pub struct ScriptLine2D {
     pub line_break: Option<String>,
 }
 
+/// HEAT2 pre-processor spatial commands that the 2D Turner does not transform.
+/// Transforming only `r`/`R` while these remain at their original coordinates
+/// would produce a silently partial model.
+pub const UNSUPPORTED_GEOMETRY_COMMANDS: &[&str] = &["s", "t", "m", "x", "b", "o"];
+
+/// Returns the distinct unsupported spatial command letters present in a HEAT2
+/// script, in first-seen order.
+pub fn unsupported_geometry_commands(script_text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for (raw, _) in crate::text::split_lines(script_text) {
+        if let Some(label) = crate::parser::leading_command_label(&raw) {
+            let label = label.to_string();
+            if UNSUPPORTED_GEOMETRY_COMMANDS.contains(&label.as_str()) && !found.contains(&label) {
+                found.push(label);
+            }
+        }
+    }
+    found
+}
+
 fn number_re() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"^-?(?:\d+(?:[,.]\d*)?|[,.]\d+)$").unwrap())

@@ -664,6 +664,55 @@ fn validate_uint8(value: i32, label: &str) -> Result<u8, String> {
     }
 }
 
+/// Prospective effect of an Air Cavities upsert, computed before any write.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MtlUpsertPreflight {
+    pub added: Vec<String>,
+    pub replaced: Vec<String>,
+}
+
+impl MtlUpsertPreflight {
+    pub fn has_replacements(&self) -> bool {
+        !self.replaced.is_empty()
+    }
+}
+
+/// Compares generated cavity materials against the existing MTL without
+/// mutating it. `replaced` lists existing records that would be overwritten
+/// because their normalized name matches a generated material name.
+pub fn preflight_air_cavity_upsert(
+    path: &Path,
+    specs: &[AirCavityMaterialSpec],
+) -> Result<MtlUpsertPreflight, String> {
+    if specs.is_empty() {
+        return Err("Нет материалов для записи.".to_string());
+    }
+    let mut new_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for spec in specs {
+        let key = normalize_material_name(&spec.material.name);
+        if !new_keys.insert(key) {
+            return Err("Список материалов содержит дублирующиеся имена.".to_string());
+        }
+    }
+    let records = parse_mtl_records(path, true)
+        .map_err(|e| format!("Не удалось прочитать .MTL файл: {}", e))?;
+    let existing_keys: std::collections::HashSet<String> = records
+        .iter()
+        .map(|record| normalize_material_name(&record.material.name))
+        .collect();
+    let replaced: Vec<String> = specs
+        .iter()
+        .filter(|spec| existing_keys.contains(&normalize_material_name(&spec.material.name)))
+        .map(|spec| spec.material.name.clone())
+        .collect();
+    let added: Vec<String> = specs
+        .iter()
+        .filter(|spec| !existing_keys.contains(&normalize_material_name(&spec.material.name)))
+        .map(|spec| spec.material.name.clone())
+        .collect();
+    Ok(MtlUpsertPreflight { added, replaced })
+}
+
 pub fn upsert_air_cavity_materials(
     path: &Path,
     specs: &[AirCavityMaterialSpec],

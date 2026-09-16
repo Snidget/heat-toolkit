@@ -80,19 +80,68 @@ fn format_plane_display(value: f64) -> String {
     crate::text::format_g(v, 10)
 }
 
+/// A supported HEAT3 geometry box, normalized to a `Segment`. `label` is one
+/// of `p` (material), `s` (material by origin+extent), `b` (boundary), or `e`
+/// (empty).
+pub struct GeometryItem {
+    pub label: &'static str,
+    pub segment: Segment,
+}
+
+/// Collects every geometry box that Model Check understands, plus the distinct
+/// official geometric commands it does not (`c`, `h`). Plane counting, cavity
+/// occupancy and simplification gating all use this single definition.
+pub fn supported_geometry(script_text: &str) -> (Vec<GeometryItem>, Vec<String>) {
+    let mut items: Vec<GeometryItem> = Vec::new();
+    let mut unsupported: Vec<String> = Vec::new();
+    for (raw, _) in crate::text::split_lines(script_text) {
+        if let Some(label) = crate::parser::leading_command_label(&raw) {
+            match label {
+                's' => {
+                    if let Some(segment) = crate::parser::parse_s_box(&raw) {
+                        items.push(GeometryItem {
+                            label: "s",
+                            segment,
+                        });
+                    }
+                    continue;
+                }
+                'c' | 'h' => {
+                    let label = label.to_string();
+                    if !unsupported.contains(&label) {
+                        unsupported.push(label);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        let line = crate::parser::parse_line(&raw);
+        if let (Some(label), Some(segment)) = (line.label, line.segment) {
+            let static_label = match label.as_str() {
+                "p" => "p",
+                "b" => "b",
+                "e" => "e",
+                _ => continue,
+            };
+            items.push(GeometryItem {
+                label: static_label,
+                segment,
+            });
+        }
+    }
+    (items, unsupported)
+}
+
 pub fn count_model_planes(script_text: &str) -> PlaneUsage {
     let mut x_planes: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut y_planes: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut z_planes: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut total_objects = 0usize;
 
-    for line in parse_script(script_text) {
-        let segment = match line.segment {
-            None => continue,
-            Some(s) => s,
-        };
-        total_objects += 1;
-        let [x1, y1, z1, x2, y2, z2] = segment.as_tuple();
+    let (items, _unsupported) = supported_geometry(script_text);
+    let total_objects = items.len();
+    for item in &items {
+        let [x1, y1, z1, x2, y2, z2] = item.segment.as_tuple();
         x_planes.insert(plane_key(x1));
         x_planes.insert(plane_key(x2));
         y_planes.insert(plane_key(y1));
@@ -125,16 +174,9 @@ struct CavityGeometry {
 fn collect_cavity_geometry(script_text: &str) -> CavityGeometry {
     let mut plane_boxes = Vec::new();
     let mut occupancy_operations = Vec::new();
-    for line in parse_script(script_text) {
-        let label = line.label.as_deref();
-        if !matches!(label, Some("p" | "b" | "e")) {
-            continue;
-        }
-        let segment = match line.segment {
-            None => continue,
-            Some(s) => s,
-        };
-        let [x1, y1, z1, x2, y2, z2] = segment.as_tuple();
+    let (items, _unsupported) = supported_geometry(script_text);
+    for item in items {
+        let [x1, y1, z1, x2, y2, z2] = item.segment.as_tuple();
         let min_x = x1.min(x2);
         let max_x = x1.max(x2);
         let min_y = y1.min(y2);
@@ -159,9 +201,9 @@ fn collect_cavity_geometry(script_text: &str) -> CavityGeometry {
         // box fills cells, while an `e` box cuts them out. BC boxes contribute
         // mesh planes, but are surfaces rather than material volume.
         plane_boxes.push(box_);
-        match label {
-            Some("p") => occupancy_operations.push((true, box_)),
-            Some("e") => occupancy_operations.push((false, box_)),
+        match item.label {
+            "p" | "s" => occupancy_operations.push((true, box_)),
+            "e" => occupancy_operations.push((false, box_)),
             _ => {}
         }
     }

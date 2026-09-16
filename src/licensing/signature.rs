@@ -80,6 +80,30 @@ impl ResponseSignatureVerifier {
         response: &SignedResponse<'_>,
         now: SystemTime,
     ) -> Result<SystemTime, ResponseSignatureError> {
+        self.verify_inner(response, now, true)
+    }
+
+    /// Verifies authenticity/integrity exactly as [`Self::verify`] but does not
+    /// reject the response for disagreeing with the local wall clock.
+    ///
+    /// This is only safe while recovering from a known clock rollback: the
+    /// authenticated server `Date` is used to repair the trusted-time floor, so
+    /// the rolled-back local clock must not be the sole freshness oracle.
+    /// Signature, key id, request target, host and digest are still enforced.
+    pub fn verify_clock_recovery(
+        &self,
+        response: &SignedResponse<'_>,
+        now: SystemTime,
+    ) -> Result<SystemTime, ResponseSignatureError> {
+        self.verify_inner(response, now, false)
+    }
+
+    fn verify_inner(
+        &self,
+        response: &SignedResponse<'_>,
+        now: SystemTime,
+        enforce_freshness: bool,
+    ) -> Result<SystemTime, ResponseSignatureError> {
         validate_component(response.method)?;
         validate_component(response.path_and_query)?;
         validate_component(response.host)?;
@@ -91,7 +115,7 @@ impl ResponseSignatureVerifier {
 
         let server_time = httpdate::parse_http_date(response.date)
             .map_err(|_| ResponseSignatureError::InvalidDate)?;
-        if absolute_difference(now, server_time) > MAX_RESPONSE_AGE {
+        if enforce_freshness && absolute_difference(now, server_time) > MAX_RESPONSE_AGE {
             return Err(ResponseSignatureError::StaleResponse);
         }
 
@@ -295,6 +319,43 @@ mod tests {
         assert_eq!(
             verifier.verify(&valid, server_time + Duration::from_secs(301)),
             Err(ResponseSignatureError::StaleResponse)
+        );
+    }
+
+    #[test]
+    fn clock_recovery_accepts_authenticated_time_without_local_freshness() {
+        let body = br#"{"meta":{"valid":true}}"#;
+        let date = "Wed, 09 Jun 2021 16:08:15 GMT";
+        let server_time = httpdate::parse_http_date(date).unwrap();
+        let (verifier, digest, signature) = signed_fixture(body, date);
+        let response = SignedResponse {
+            method: "POST",
+            path_and_query: "/v1/accounts/account-id/licenses/actions/validate-key",
+            host: "licensing.example.test",
+            date,
+            digest: &digest,
+            signature: &signature,
+            body,
+        };
+        // Local clock is an hour behind; strict verification rejects it.
+        let rolled_back_now = server_time - Duration::from_secs(3600);
+        assert_eq!(
+            verifier.verify(&response, rolled_back_now),
+            Err(ResponseSignatureError::StaleResponse)
+        );
+        // Recovery still requires a valid signature and returns server time.
+        assert_eq!(
+            verifier.verify_clock_recovery(&response, rolled_back_now),
+            Ok(server_time)
+        );
+        // A tampered body is still rejected during recovery.
+        let tampered = SignedResponse {
+            body: br#"{"meta":{"valid":false}}"#,
+            ..response
+        };
+        assert_eq!(
+            verifier.verify_clock_recovery(&tampered, rolled_back_now),
+            Err(ResponseSignatureError::DigestMismatch)
         );
     }
 

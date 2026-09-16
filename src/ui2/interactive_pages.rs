@@ -67,6 +67,10 @@ pub struct CheckPage {
     pub collapsed: Vec<bool>,
     pub simplified: Option<String>,
     pub cached_script: String,
+    /// Official geometric commands (e.g. `c`, `h`) that Check does not model.
+    pub unsupported: Vec<String>,
+    /// True when simplification would silently ignore real geometry (`s`/`c`/`h`).
+    pub simplification_blocked: bool,
     analysis_pending_since: Option<Instant>,
     generation: u64,
 }
@@ -85,6 +89,8 @@ impl Default for CheckPage {
             collapsed: Vec::new(),
             simplified: None,
             cached_script: String::new(),
+            unsupported: Vec::new(),
+            simplification_blocked: false,
             analysis_pending_since: None,
             generation: 0,
         }
@@ -105,6 +111,13 @@ impl CheckPage {
         self.checked.clear();
         self.collapsed.clear();
         self.simplified = None;
+        let (items, unsupported) = crate::model_check::supported_geometry(script);
+        let has_s = items.iter().any(|item| item.label == "s");
+        self.unsupported = unsupported;
+        // `s` boxes are counted and contribute cavity occupancy, but the
+        // simplifier cannot rewrite them, so any simplification would be
+        // partial while ignoring real material geometry.
+        self.simplification_blocked = !self.unsupported.is_empty() || has_s;
         if script.trim().is_empty() {
             self.analysis_pending_since = None;
             return None;
@@ -123,6 +136,8 @@ impl CheckPage {
         self.checked.clear();
         self.collapsed.clear();
         self.simplified = None;
+        self.unsupported.clear();
+        self.simplification_blocked = false;
         self.analysis_pending_since = None;
     }
 
@@ -192,11 +207,17 @@ impl CheckPage {
             self.cavity = Some(cavity);
         }
         self.analysis = Some(result.analysis);
-        self.proposals = self
-            .analysis
-            .as_ref()
-            .map(|analysis| analysis.proposals.clone())
-            .unwrap_or_default();
+        if self.simplification_blocked {
+            // Do not offer proposals that were computed while real geometry was
+            // ignored by the simplifier.
+            self.proposals.clear();
+        } else {
+            self.proposals = self
+                .analysis
+                .as_ref()
+                .map(|analysis| analysis.proposals.clone())
+                .unwrap_or_default();
+        }
         self.checked = vec![true; self.proposals.len()];
         self.collapsed = vec![false; self.proposals.len()];
         true
@@ -230,6 +251,16 @@ impl CheckPage {
             Message::CheckPaste,
         ));
 
+        if !self.unsupported.is_empty() {
+            content = content.push(Self::colored(
+                format!(
+                    "Анализ неполный: скрипт содержит геометрические команды, которые Проверка не моделирует: {}. Результаты ниже могут быть неполными.",
+                    self.unsupported.join(", ")
+                ),
+                theme::Status::Error,
+            ));
+        }
+
         content = content.push(section_title("Использование плоскостей"));
         let usage = self
             .usage
@@ -248,12 +279,22 @@ impl CheckPage {
             Some(cavity) => {
                 let status = if cavity.cavities_found() {
                     theme::Status::Error
-                } else if cavity.skipped {
+                } else if cavity.skipped || !self.unsupported.is_empty() {
                     theme::Status::Warn
                 } else {
                     theme::Status::Ok
                 };
-                content = content.push(Self::colored(format_cavity_check(cavity), status));
+                if !cavity.cavities_found() && !self.unsupported.is_empty() {
+                    content = content.push(Self::colored(
+                        format!(
+                            "{} Результат неполный из-за неподдерживаемых команд.",
+                            format_cavity_check(cavity)
+                        ),
+                        status,
+                    ));
+                } else {
+                    content = content.push(Self::colored(format_cavity_check(cavity), status));
+                }
             }
             None => {
                 content = content.push(
@@ -263,6 +304,13 @@ impl CheckPage {
         }
 
         content = content.push(section_title("Упрощение модели"));
+        if self.simplification_blocked && !self.cached_script.trim().is_empty() {
+            content = content.push(Self::colored(
+                "Упрощение недоступно: модель содержит material-боксы формата `s` или неподдерживаемые команды, которые упроститель не изменяет."
+                    .to_owned(),
+                theme::Status::Warn,
+            ));
+        }
         content = content.push(
             row![
                 text("Порог схождения (мм):").size(theme::BODY_SIZE),

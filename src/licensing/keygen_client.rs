@@ -107,6 +107,10 @@ pub struct KeygenClient {
     http: Client,
     response_verifier: ResponseSignatureVerifier,
     certificate_verifier: MachineCertificateVerifier,
+    /// When true, authenticated responses are accepted even if their `Date`
+    /// disagrees with a known-rolled-back local clock; the signed server time
+    /// is then used to repair the trusted-time floor.
+    clock_recovery: bool,
 }
 
 impl KeygenClient {
@@ -130,7 +134,16 @@ impl KeygenClient {
             http,
             response_verifier,
             certificate_verifier,
+            clock_recovery: false,
         })
+    }
+
+    /// Enables clock-rollback recovery for this client: authenticated responses
+    /// are accepted regardless of local-clock disagreement, and the signed
+    /// server time is returned so the caller can repair its trusted floor.
+    pub fn with_clock_recovery(mut self, enabled: bool) -> Self {
+        self.clock_recovery = enabled;
+        self
     }
 
     pub fn validate_key(
@@ -367,6 +380,20 @@ impl KeygenClient {
             .map_err(classify_transport)?;
         let status = response.status();
         let url = response.url().clone();
+        // A reverse proxy, tunnel, or load balancer in front of Keygen can
+        // generate its own unsigned 429/5xx page during an outage. Such a
+        // response must never become an authoritative licensing decision, but
+        // it can be classified as a transient outage so a still-valid signed
+        // offline lease is preserved instead of being dropped.
+        let has_signature_headers = response.headers().contains_key(DATE.as_str())
+            && response.headers().contains_key("digest")
+            && response.headers().contains_key("keygen-signature");
+        if !status.is_success() && !has_signature_headers && is_transient_status(status) {
+            return Err(KeygenClientError::Api {
+                status: status.as_u16(),
+                code: None,
+            });
+        }
         let date = header(&response, DATE.as_str())?;
         let digest = header(&response, "digest")?;
         let signature = header(&response, "keygen-signature")?;
@@ -390,18 +417,21 @@ impl KeygenClient {
             None => url.path().to_owned(),
         };
         let host = signed_host(&url)?;
-        let server_time = self.response_verifier.verify(
-            &SignedResponse {
-                method: method.as_str(),
-                path_and_query: &path_and_query,
-                host: &host,
-                date: &date,
-                digest: &digest,
-                signature: &signature,
-                body: &body,
-            },
-            SystemTime::now(),
-        )?;
+        let signed = SignedResponse {
+            method: method.as_str(),
+            path_and_query: &path_and_query,
+            host: &host,
+            date: &date,
+            digest: &digest,
+            signature: &signature,
+            body: &body,
+        };
+        let now = SystemTime::now();
+        let server_time = if self.clock_recovery {
+            self.response_verifier.verify_clock_recovery(&signed, now)?
+        } else {
+            self.response_verifier.verify(&signed, now)?
+        };
         let server_time = server_time
             .duration_since(UNIX_EPOCH)
             .ok()
@@ -631,6 +661,10 @@ fn parse_machine_list(
         server_time,
     )
     .map(Some)
+}
+
+fn is_transient_status(status: StatusCode) -> bool {
+    status.as_u16() == 429 || status.is_server_error()
 }
 
 fn parse_api_error(status: StatusCode, body: &[u8]) -> KeygenClientError {

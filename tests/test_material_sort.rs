@@ -1,3 +1,5 @@
+use heat3_povorotnik::material_sort::is_material_reorder_safe;
+use heat3_povorotnik::material_sort::materials_by_normalized_name_checked;
 use heat3_povorotnik::material_sort::{
     extract_material_entries, parse_mtl_file, sort_material_boxes_by_order,
     sort_material_names_by_conductivity, write_mtl_file, MtlMaterial, NAME_FIELD_SIZE,
@@ -234,4 +236,42 @@ fn test_strict_mtl_load_rejects_corrupt_records_and_trailing_bytes() {
     assert!(parse_mtl_file(&path, true).is_err());
 
     std::fs::remove_file(&path).ok();
+}
+
+fn material(name: &str, thermal_x: f64) -> MtlMaterial {
+    MtlMaterial {
+        name: name.to_string(),
+        thermal_x,
+        thermal_y: thermal_x,
+        volume_heat: 0.0,
+        rgb_r: 0,
+        rgb_g: 0,
+        rgb_b: 0,
+        special_value: 0,
+    }
+}
+
+#[test]
+fn test_material_index_rejects_conflicting_duplicate_names() {
+    let conflicting = vec![material("Brick", 0.1), material("brick ", 0.2)];
+    assert!(materials_by_normalized_name_checked(&conflicting).is_err());
+
+    let identical = vec![material("Brick", 0.1), material("brick", 0.1)];
+    let map = materials_by_normalized_name_checked(&identical).unwrap();
+    assert_eq!(map.len(), 1);
+}
+
+#[test]
+fn test_reorder_safety_allows_disjoint_and_blocks_overlapping_boxes() {
+    let disjoint = "p 0 0 0 1 1 1 A\np 2 0 0 3 1 1 B";
+    assert!(is_material_reorder_safe(disjoint));
+
+    let overlapping = "p 0 0 0 1 1 1 A\np 0.5 0 0 1.5 1 1 B";
+    assert!(!is_material_reorder_safe(overlapping));
+}
+
+#[test]
+fn test_reorder_safety_blocks_material_box_crossing_an_empty_box() {
+    let script = "p 0 0 0 1 1 1 A\ne 0.5 0 0 1.5 1 1\np 2 0 0 3 1 1 B";
+    assert!(!is_material_reorder_safe(script));
 }

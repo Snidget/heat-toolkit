@@ -1,6 +1,6 @@
 use heat3_povorotnik::model_check::{
     count_model_planes, detect_internal_cavities, format_cavity_check, simplify_proposals,
-    MergeProposal,
+    supported_geometry, MergeProposal,
 };
 
 fn box_line(x1: i32, y1: i32, z1: i32, x2: i32, y2: i32, z2: i32, label: &str) -> String {
@@ -126,6 +126,39 @@ fn test_detect_internal_cavities_applies_material_and_empty_boxes_in_script_orde
     let result = detect_internal_cavities(script, 1_000_000);
 
     assert!(result.cavities.is_empty());
+}
+
+#[test]
+fn test_s_material_box_contributes_planes_and_occupancy_like_p() {
+    let p_script = "p 0 0 0 1 1 1 Material\np 0.2 0.2 0.2 0.4 0.4 0.4 Inner";
+    let s_script = "p 0 0 0 1 1 1 Material\ns 0.2 0.2 0.2 0.2 0.2 0.2 Inner";
+
+    let p_usage = count_model_planes(p_script);
+    let s_usage = count_model_planes(s_script);
+    assert_eq!(p_usage.x, s_usage.x);
+    assert_eq!(p_usage.y, s_usage.y);
+    assert_eq!(p_usage.z, s_usage.z);
+    assert_eq!(p_usage.total_objects, s_usage.total_objects);
+}
+
+#[test]
+fn test_s_material_box_fills_cutout_like_an_equivalent_p_box() {
+    // `e` cuts a void, then an `s` material box refills it: no cavity remains.
+    let script = "p 0 0 0 3 3 3 Material\ne 1 1 1 2 2 2\ns 1 1 1 1 1 1 Material";
+    let result = detect_internal_cavities(script, 1_000_000);
+    assert!(result.cavities.is_empty());
+}
+
+#[test]
+fn test_unsupported_geometry_is_reported() {
+    let (_, unsupported) =
+        supported_geometry("p 0 0 0 1 1 1 Material\nc 0 0 0 1 1 1\nh 0 0 0 1 1 1 10");
+    assert_eq!(unsupported, vec!["c".to_owned(), "h".to_owned()]);
+
+    let (items, unsupported) =
+        supported_geometry("p 0 0 0 1 1 1 Material\ns 1 0 0 0.2 1 1 Insulation");
+    assert!(unsupported.is_empty());
+    assert!(items.iter().any(|item| item.label == "s"));
 }
 
 #[test]

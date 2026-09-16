@@ -22,6 +22,21 @@ fn label_sep_re() -> &'static regex::Regex {
     RE.get_or_init(|| regex::Regex::new(r"^(p|b|e)(\s+)(.*)$").unwrap())
 }
 
+/// Returns the lowercased leading script command letter for a raw line
+/// (e.g. `s 0 0 0 ...` -> `'s'`). Returns `None` for empty lines, comments,
+/// `%` directives, and any line that is not `<letter><whitespace>...`.
+pub fn leading_command_label(line: &str) -> Option<char> {
+    let mut chars = line.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    match chars.next() {
+        Some(c) if c.is_whitespace() => Some(first.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
 pub(crate) fn take_token(input: &str) -> Option<(&str, &str)> {
     let trimmed = input.trim_start();
     if trimmed.is_empty() {
@@ -94,6 +109,35 @@ pub fn parse_line(line: &str) -> ScriptLine {
         extra_raw,
         line_break: None,
     }
+}
+
+/// Parses an official HEAT3 `s x1 y1 z1 dx dy dz material` material box into
+/// the same normalized segment form used for `p` boxes (origin + extents).
+/// Returns `None` for any line that is not a valid `s` material box.
+pub fn parse_s_box(line: &str) -> Option<Segment> {
+    let trimmed = line.trim_start();
+    let first = trimmed.chars().next()?;
+    if first != 's' && first != 'S' {
+        return None;
+    }
+    let mut chars = trimmed.chars();
+    chars.next();
+    match chars.next() {
+        Some(c) if c.is_whitespace() => {}
+        _ => return None,
+    }
+    let mut remainder = chars.as_str();
+    let mut nums = [0.0f64; 6];
+    for coordinate in &mut nums {
+        let (token, after) = take_token(remainder)?;
+        match token.parse::<f64>() {
+            Ok(v) if v.is_finite() => *coordinate = v,
+            _ => return None,
+        }
+        remainder = after;
+    }
+    let [x, y, z, dx, dy, dz] = nums;
+    Some(Segment::new(x, y, z, x + dx, y + dy, z + dz))
 }
 
 pub fn parse_script(text: &str) -> Vec<ScriptLine> {

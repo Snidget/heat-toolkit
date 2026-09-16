@@ -24,6 +24,12 @@ pub fn detect_constant_pair(script_text: &str) -> Option<ConstantPair> {
     let mut pairs = HashMap3::new();
 
     for line in parse_script(script_text) {
+        // Only material (`p`) boxes define the structural section. Boundary
+        // (`b`) and empty (`e`) boxes may legitimately have different extents
+        // and must not make a valid pseudo-2D material section look invalid.
+        if line.label.as_deref() != Some("p") {
+            continue;
+        }
         let seg = match &line.segment {
             None => continue,
             Some(s) => s,
@@ -204,7 +210,13 @@ pub fn create_corner(script_text: &str, direction: &str) -> String {
     let edge_axis = dir_params.edge_axis.clone();
     let extend_axis = dir_params.extend_axis.clone();
 
-    let elements: Vec<&ScriptLine> = lines.iter().filter(|l| l.segment.is_some()).collect();
+    // Structural inference (hinge, frame, thickness) uses material geometry
+    // only. Boundary-condition and empty boxes are still transformed in the
+    // output pass below, but they must not define the corner dimensions.
+    let elements: Vec<&ScriptLine> = lines
+        .iter()
+        .filter(|l| l.segment.is_some() && l.label.as_deref() == Some("p"))
+        .collect();
     if elements.is_empty() {
         return script_text.to_string();
     }
@@ -368,5 +380,60 @@ pub fn create_corner(script_text: &str, direction: &str) -> String {
         }
     }
 
+    let result = deduplicate_corner_result(result);
     serialize_script(&result, crate::config::LINE_BREAK)
+}
+
+/// Removes redundant generated material boxes: exact duplicates and boxes fully
+/// contained by another box with the same material metadata. Conservative:
+/// only same-label, same-trailing `p` boxes are compared.
+fn deduplicate_corner_result(lines: Vec<ScriptLine>) -> Vec<ScriptLine> {
+    let mut keep = vec![true; lines.len()];
+    for i in 0..lines.len() {
+        if !keep[i] || lines[i].label.as_deref() != Some("p") {
+            continue;
+        }
+        let Some(si) = lines[i].segment else {
+            continue;
+        };
+        for j in (i + 1)..lines.len() {
+            if !keep[j] || lines[j].label.as_deref() != Some("p") {
+                continue;
+            }
+            if lines[i].trailing != lines[j].trailing {
+                continue;
+            }
+            let Some(sj) = lines[j].segment else {
+                continue;
+            };
+            if same_seg(&si, &sj) || seg_contains(&si, &sj) {
+                keep[j] = false;
+            } else if seg_contains(&sj, &si) {
+                keep[i] = false;
+                break;
+            }
+        }
+    }
+    lines
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(line, keep)| keep.then_some(line))
+        .collect()
+}
+
+fn seg_contains(outer: &Segment, inner: &Segment) -> bool {
+    let [ox1, oy1, oz1, ox2, oy2, oz2] = outer.as_tuple();
+    let [ix1, iy1, iz1, ix2, iy2, iz2] = inner.as_tuple();
+    let (ox_lo, ox_hi) = (ox1.min(ox2), ox1.max(ox2));
+    let (oy_lo, oy_hi) = (oy1.min(oy2), oy1.max(oy2));
+    let (oz_lo, oz_hi) = (oz1.min(oz2), oz1.max(oz2));
+    let (ix_lo, ix_hi) = (ix1.min(ix2), ix1.max(ix2));
+    let (iy_lo, iy_hi) = (iy1.min(iy2), iy1.max(iy2));
+    let (iz_lo, iz_hi) = (iz1.min(iz2), iz1.max(iz2));
+    ox_lo <= ix_lo + TOL
+        && ox_hi >= ix_hi - TOL
+        && oy_lo <= iy_lo + TOL
+        && oy_hi >= iy_hi - TOL
+        && oz_lo <= iz_lo + TOL
+        && oz_hi >= iz_hi - TOL
 }

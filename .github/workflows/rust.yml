@@ -205,6 +205,24 @@ jobs:
             }
           }
 
+      - name: Enforce release version matches Cargo and tag
+        shell: pwsh
+        run: |
+          $cargoVersion = (Select-String -LiteralPath "Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value.Trim()
+          $refName = $env:GITHUB_REF_NAME
+          if ($refName -and $refName.StartsWith("v")) {
+            $tagVersion = $refName.Substring(1)
+            if ($tagVersion -ne $cargoVersion) {
+              throw "Tag $refName does not match Cargo version $cargoVersion — update Cargo.toml or tag before release."
+            }
+            Write-Output "Version check: tag $refName matches Cargo $cargoVersion"
+          } else {
+            Write-Output "Version check: non-tag build, Cargo $cargoVersion"
+          }
+          if (-not (Select-String -LiteralPath "src/ui2/platform.rs" -Pattern 'env!\("CARGO_PKG_VERSION"\)')) {
+            throw "WINDOW_TITLE must derive from env!(""CARGO_PKG_VERSION"")"
+          }
+
       - name: Build and verify release client configuration
         shell: pwsh
         run: |

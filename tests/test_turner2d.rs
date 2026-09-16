@@ -1,6 +1,16 @@
 use heat3_povorotnik::turner2d::{
-    parse_2d_script, serialize_2d_script, transform_2d_script, TRANSFORMS_2D,
+    parse_2d_script, serialize_2d_script, transform_2d_script, unsupported_geometry_commands,
+    TRANSFORMS_2D,
 };
+
+#[test]
+fn test_unsupported_2d_spatial_commands_are_reported() {
+    let script = "r 0 0 1 1 Brick\ns 1 0 0.2 1 Insulation\nx 0.5 0.5";
+    let unsupported = unsupported_geometry_commands(script);
+    assert_eq!(unsupported, vec!["s".to_owned(), "x".to_owned()]);
+
+    assert!(unsupported_geometry_commands("R 0 0 1 1 Brick").is_empty());
+}
 
 #[test]
 fn test_parse_and_serialize_2d_script_outputs_dot_decimal_separator() {

@@ -1,5 +1,16 @@
 use heat3_povorotnik::parser::{parse_script, serialize_script};
-use heat3_povorotnik::transforms::{apply_transform, transform_enable_flags, ENABLE_TRANSFORMS};
+use heat3_povorotnik::transforms::{
+    apply_transform, transform_enable_flags, unsupported_geometry_commands, ENABLE_TRANSFORMS,
+};
+
+#[test]
+fn test_unsupported_3d_geometry_commands_are_reported() {
+    let script = "p 0 0 0 1 1 1 Brick\ns 1 0 0 0.2 1 1 Insulation\nh 0.2 0.2 0.2 0.3 0.3 0.3 100";
+    let unsupported = unsupported_geometry_commands(script);
+    assert_eq!(unsupported, vec!["s".to_owned(), "h".to_owned()]);
+
+    assert!(unsupported_geometry_commands("p 0 0 0 1 1 1 Brick\nb 0 0 0 1 1 1 2").is_empty());
+}
 
 #[test]
 fn test_enable_flag_permutation_order() {
