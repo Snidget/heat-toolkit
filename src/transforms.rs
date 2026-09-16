@@ -8,6 +8,26 @@ use std::sync::OnceLock;
 
 use crate::models::Segment;
 
+/// HEAT3 coordinate-bearing commands that the 3D Turner transforms only for
+/// `p`/`b`/`e`. Anything else here would silently remain in the old coordinate
+/// system, so transforms are refused while such commands are present.
+pub const UNSUPPORTED_GEOMETRY_COMMANDS: &[&str] = &["s", "c", "h"];
+
+/// Returns the distinct unsupported geometric command letters present in a
+/// HEAT3 script, in first-seen order.
+pub fn unsupported_geometry_commands(script_text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for (raw, _) in crate::text::split_lines(script_text) {
+        if let Some(label) = crate::parser::leading_command_label(&raw) {
+            let label = label.to_string();
+            if UNSUPPORTED_GEOMETRY_COMMANDS.contains(&label.as_str()) && !found.contains(&label) {
+                found.push(label);
+            }
+        }
+    }
+    found
+}
+
 fn enable_re() -> &'static regex::Regex {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| regex::Regex::new(r"(%enable=)([01]{6})([^01]|$)").unwrap())
@@ -121,10 +141,10 @@ pub const ENABLE_TRANSFORMS: &[(&str, EnableFn)] = &[
 ];
 
 fn enable_transform_x(mask: &str) -> String {
-    enable_transform([2, 3, 0, 1, 4, 5])(mask)
+    enable_transform([2, 3, 1, 0, 4, 5])(mask)
 }
 fn enable_transform_ccw(mask: &str) -> String {
-    enable_transform([3, 2, 1, 0, 4, 5])(mask)
+    enable_transform([3, 2, 0, 1, 4, 5])(mask)
 }
 fn enable_transform_swap(mask: &str) -> String {
     enable_transform([0, 1, 4, 5, 2, 3])(mask)

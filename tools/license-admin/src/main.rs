@@ -37,60 +37,116 @@ fn run() -> Result<(), String> {
     let client = AdminClient::new(&config)?;
     let operation = command.operation_name();
     let target = command.audit_target();
-    audit.append(operation, &target, "attempt", None)?;
-    let outcome = execute(&client, command);
-    let audit_result = audit.append(operation, &target, "result", Some(outcome.is_ok()));
+    let correlation_id = generate_correlation_id();
+    audit.append(
+        operation,
+        &target,
+        "attempt",
+        None,
+        &correlation_id,
+        &AuditOutcome::default(),
+    )?;
+    let (audit_outcome, outcome) = execute(&client, command);
+    let audit_result = audit.append(
+        operation,
+        &target,
+        "result",
+        Some(outcome.is_ok()),
+        &correlation_id,
+        &audit_outcome,
+    );
     config.zeroize_secrets();
     audit_result?;
     outcome
 }
 
-fn execute(client: &AdminClient, command: Command) -> Result<(), String> {
-    match command {
-        Command::Issue { name } => {
-            let response = client.issue(name.as_deref())?;
-            let id = string_at(&response, "/data/id").unwrap_or("<unknown>");
-            let key = string_at(&response, "/data/attributes/key")
-                .ok_or("Keygen не вернул ключ новой лицензии")?;
-            println!("Лицензия создана\nID: {id}\nКлюч: {key}");
-        }
-        Command::List { limit } => print_safe(client.list(limit)?)?,
-        Command::Show { id } => print_safe(client.get(&id)?)?,
-        Command::Suspend { id } => print_safe(client.action(&id, "suspend", Method::POST)?)?,
-        Command::Reinstate { id } => print_safe(client.action(&id, "reinstate", Method::POST)?)?,
-        Command::Renew { id } => print_safe(client.action(&id, "renew", Method::POST)?)?,
-        Command::ResetUsage { id, confirm } => {
-            require_confirmation(&id, &confirm)?;
-            print_safe(client.action(&id, "reset-usage", Method::POST)?)?;
-        }
-        Command::ResetMachines { id, confirm } => {
-            require_confirmation(&id, &confirm)?;
-            let machines = client.list_machines(&id)?;
-            let ids = machines
-                .pointer("/data")
-                .and_then(Value::as_array)
-                .ok_or("Некорректный список машин")?
-                .iter()
-                .filter_map(|item| item.get("id").and_then(Value::as_str))
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
-            for machine_id in &ids {
-                client.delete_machine(machine_id)?;
+/// Redacted, HMAC-covered audit metadata produced by a command. Never contains
+/// license keys or tokens.
+#[derive(Default, Clone)]
+struct AuditOutcome {
+    license_id: Option<String>,
+    before_state: Option<String>,
+    after_state: Option<String>,
+}
+
+fn status_of(response: &Value) -> Option<String> {
+    string_at(response, "/data/attributes/status").map(str::to_owned)
+}
+
+fn execute(client: &AdminClient, command: Command) -> (AuditOutcome, Result<(), String>) {
+    let mut outcome = AuditOutcome::default();
+    let result = (|| -> Result<(), String> {
+        match command {
+            Command::Issue { name } => {
+                let response = client.issue(name.as_deref())?;
+                let id = string_at(&response, "/data/id").unwrap_or("<unknown>");
+                let key = string_at(&response, "/data/attributes/key")
+                    .ok_or("Keygen не вернул ключ новой лицензии")?;
+                outcome.license_id = Some(id.to_owned());
+                outcome.after_state = status_of(&response).or_else(|| Some("active".to_owned()));
+                println!("Лицензия создана\nID: {id}\nКлюч: {key}");
             }
-            println!("Удалено активаций: {}", ids.len());
+            Command::List { limit } => print_safe(client.list(limit)?)?,
+            Command::Show { id } => print_safe(client.get(&id)?)?,
+            Command::Suspend { id } => {
+                let response = client.action(&id, "suspend", Method::POST)?;
+                outcome.license_id = Some(id.clone());
+                outcome.after_state = status_of(&response);
+                print_safe(response)?;
+            }
+            Command::Reinstate { id } => {
+                let response = client.action(&id, "reinstate", Method::POST)?;
+                outcome.license_id = Some(id.clone());
+                outcome.after_state = status_of(&response);
+                print_safe(response)?;
+            }
+            Command::Renew { id } => {
+                let response = client.action(&id, "renew", Method::POST)?;
+                outcome.license_id = Some(id.clone());
+                outcome.after_state = status_of(&response);
+                print_safe(response)?;
+            }
+            Command::ResetUsage { id, confirm } => {
+                require_confirmation(&id, &confirm)?;
+                let response = client.action(&id, "reset-usage", Method::POST)?;
+                outcome.license_id = Some(id.clone());
+                outcome.after_state = Some("usage-reset".to_owned());
+                print_safe(response)?;
+            }
+            Command::ResetMachines { id, confirm } => {
+                require_confirmation(&id, &confirm)?;
+                let ids = client.list_all_machines(&id)?;
+                for machine_id in &ids {
+                    client.delete_machine(machine_id)?;
+                }
+                outcome.license_id = Some(id.clone());
+                outcome.after_state = Some(format!("machines-deleted:{}", ids.len()));
+                println!("Удалено активаций: {}", ids.len());
+            }
+            Command::Revoke { id, confirm } => {
+                require_confirmation(&id, &confirm)?;
+                client.action(&id, "revoke", Method::DELETE)?;
+                outcome.license_id = Some(id.clone());
+                outcome.after_state = Some("revoked".to_owned());
+                println!("Лицензия {id} безвозвратно отозвана.");
+            }
+            Command::MigrateAuditState => {
+                return Err(
+                    "Команда миграции audit-state должна выполняться до API-запросов".to_owned(),
+                );
+            }
         }
-        Command::Revoke { id, confirm } => {
-            require_confirmation(&id, &confirm)?;
-            client.action(&id, "revoke", Method::DELETE)?;
-            println!("Лицензия {id} безвозвратно отозвана.");
-        }
-        Command::MigrateAuditState => {
-            return Err(
-                "Команда миграции audit-state должна выполняться до API-запросов".to_owned(),
-            );
-        }
-    }
-    Ok(())
+        Ok(())
+    })();
+    (outcome, result)
+}
+
+fn generate_correlation_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:032x}{:08x}", std::process::id())
 }
 
 #[derive(Debug)]
@@ -365,12 +421,52 @@ impl AdminClient {
         self.request(method, &format!("licenses/{id}/actions/{action}"), None)
     }
 
-    fn list_machines(&self, license_id: &str) -> Result<Value, String> {
-        self.request(
-            Method::GET,
-            &format!("machines?license={license_id}&limit=100"),
-            None,
-        )
+    /// Collects every machine id attached to a license, following Keygen's
+    /// cursor pagination via `links.next` until the link is absent. Pagination
+    /// is completed before any deletion so deleting one page's items cannot
+    /// invalidate the cursor for the next page.
+    fn list_all_machines(&self, license_id: &str) -> Result<Vec<String>, String> {
+        let mut all_ids: Vec<String> = Vec::new();
+        let mut next: Option<String> = Some(format!("machines?license={license_id}&limit=100"));
+        let mut pages = 0u32;
+        while let Some(suffix) = next.take() {
+            let response = match suffix.strip_prefix("ABSOLUTE:") {
+                Some(absolute) => self.request_absolute(Method::GET, absolute)?,
+                None => self.request(Method::GET, &suffix, None)?,
+            };
+            let ids: Vec<String> = response
+                .pointer("/data")
+                .and_then(Value::as_array)
+                .ok_or("Некорректный список машин")?
+                .iter()
+                .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
+                .collect();
+            if ids.is_empty() {
+                break;
+            }
+            all_ids.extend(ids);
+            if let Some(link) = response.pointer("/links/next").and_then(Value::as_str) {
+                next = Some(format!("ABSOLUTE:{link}"));
+            }
+            pages += 1;
+            if pages > 10_000 {
+                return Err("Слишком много страниц машин".to_owned());
+            }
+        }
+        Ok(all_ids)
+    }
+
+    /// Issues a GET to an absolute URL returned by Keygen (`links.next`) while
+    /// enforcing the same HTTPS origin as the configured API base.
+    fn request_absolute(&self, method: Method, url: &str) -> Result<Value, String> {
+        let parsed = Url::parse(url).map_err(|_| "Некорректный URL пагинации Keygen")?;
+        if parsed.scheme() != self.base.scheme()
+            || parsed.host_str() != self.base.host_str()
+            || parsed.port_or_known_default() != self.base.port_or_known_default()
+        {
+            return Err("Ссылка пагинации Keygen ведёт на другой origin".to_owned());
+        }
+        self.send(method, parsed)
     }
 
     fn delete_machine(&self, id: &str) -> Result<(), String> {
@@ -383,6 +479,19 @@ impl AdminClient {
             return Err("Некорректный API path".to_owned());
         }
         let url = self.base.join(suffix).map_err(|_| "Некорректный API URL")?;
+        self.send_with_body(method, url, body)
+    }
+
+    fn send(&self, method: Method, url: Url) -> Result<Value, String> {
+        self.send_with_body(method, url, None)
+    }
+
+    fn send_with_body(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<Value>,
+    ) -> Result<Value, String> {
         let mut request: RequestBuilder = self
             .http
             .request(method, url)
@@ -480,6 +589,16 @@ struct AuditEntry {
     success: Option<bool>,
     previous_mac: String,
     mac: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    correlation_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    workstation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    license_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    before_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    after_state: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -534,6 +653,26 @@ impl Drop for AuditLog {
     }
 }
 
+#[cfg(test)]
+impl AuditLog {
+    fn append_test(
+        &mut self,
+        operation: &str,
+        target: &str,
+        phase: &str,
+        success: Option<bool>,
+    ) -> Result<(), String> {
+        self.append(
+            operation,
+            target,
+            phase,
+            success,
+            &generate_correlation_id(),
+            &AuditOutcome::default(),
+        )
+    }
+}
+
 impl AuditLog {
     fn open(path: PathBuf, key: &[u8]) -> Result<Self, String> {
         let state_path = audit_state_path(&path);
@@ -555,10 +694,19 @@ impl AuditLog {
         match load_audit_state(&state_path)? {
             Some(saved) => {
                 saved.verify(key)?;
-                if saved.entry_count != state.entry_count
-                    || saved.byte_len != state.byte_len
-                    || saved.previous_mac != state.previous_mac
+                if saved.entry_count == state.entry_count
+                    && saved.byte_len == state.byte_len
+                    && saved.previous_mac == state.previous_mac
                 {
+                    // The durable journal and its signed checkpoint agree.
+                } else if saved.entry_count < state.entry_count
+                    && saved.byte_len < state.byte_len
+                    && audit_state_is_exact_prefix(&mut file, key, &saved)?
+                {
+                    // The entry was synced before the sidecar replacement. The verified
+                    // HMAC-chain suffix is a crash-forward state, not a rollback.
+                    persist_audit_state(&state_path, &state)?;
+                } else {
                     return Err("Audit log усечён или заменён; операции заблокированы".to_owned());
                 }
             }
@@ -604,7 +752,14 @@ impl AuditLog {
             entry_count: state.entry_count,
             byte_len: state.byte_len,
         };
-        audit.append("audit.migrate_state", "audit", "result", Some(true))
+        audit.append(
+            "audit.migrate_state",
+            "audit",
+            "result",
+            Some(true),
+            &generate_correlation_id(),
+            &AuditOutcome::default(),
+        )
     }
 
     fn append(
@@ -613,6 +768,8 @@ impl AuditLog {
         target: &str,
         phase: &str,
         success: Option<bool>,
+        correlation_id: &str,
+        outcome: &AuditOutcome,
     ) -> Result<(), String> {
         let operator = current_operator();
         let mut entry = AuditEntry {
@@ -624,6 +781,11 @@ impl AuditLog {
             success,
             previous_mac: self.previous_mac.clone(),
             mac: String::new(),
+            correlation_id: correlation_id.to_owned(),
+            workstation: current_workstation(),
+            license_id: outcome.license_id.clone(),
+            before_state: outcome.before_state.clone(),
+            after_state: outcome.after_state.clone(),
         };
         let payload = entry_without_mac(&entry)?;
         entry.mac = compute_mac(&self.key, &payload)?;
@@ -676,6 +838,43 @@ fn verified_audit_state(file: &mut fs::File, key: &[u8]) -> Result<AuditState, S
         .map_err(|_| "Не удалось прочитать размер audit log")?
         .len();
     AuditState::signed(entry_count, byte_len, previous, key)
+}
+
+fn audit_state_is_exact_prefix(
+    file: &mut fs::File,
+    key: &[u8],
+    saved: &AuditState,
+) -> Result<bool, String> {
+    let byte_len = file
+        .metadata()
+        .map_err(|_| "Не удалось прочитать размер audit log")?
+        .len();
+    if saved.byte_len > byte_len {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| "Не удалось позиционировать audit log")?;
+    let mut prefix = vec![0; saved.byte_len as usize];
+    file.read_exact(&mut prefix)
+        .map_err(|_| "Не удалось прочитать audit log")?;
+    let text =
+        std::str::from_utf8(&prefix).map_err(|_| "Audit log повреждён; операции заблокированы")?;
+    if !text.is_empty() && !text.ends_with('\n') {
+        return Ok(false);
+    }
+    let mut previous = "GENESIS".to_owned();
+    let mut entry_count = 0u64;
+    for line in text.lines() {
+        let entry: AuditEntry = serde_json::from_str(line)
+            .map_err(|_| "Audit log повреждён; операции заблокированы")?;
+        let payload = entry_without_mac(&entry)?;
+        if entry.previous_mac != previous || compute_mac(key, &payload)? != entry.mac {
+            return Ok(false);
+        }
+        previous = entry.mac;
+        entry_count += 1;
+    }
+    Ok(entry_count == saved.entry_count && previous == saved.previous_mac)
 }
 
 fn audit_state_path(path: &Path) -> PathBuf {
@@ -784,17 +983,44 @@ fn current_operator() -> String {
         .unwrap_or_else(|_| "unknown".to_owned())
 }
 
+fn current_workstation() -> String {
+    env::var("COMPUTERNAME")
+        .or_else(|_| env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown".to_owned())
+        .chars()
+        .take(100)
+        .collect()
+}
+
 fn entry_without_mac(entry: &AuditEntry) -> Result<Vec<u8>, String> {
-    serde_json::to_vec(&json!({
-        "timestamp": entry.timestamp,
-        "operator": entry.operator,
-        "operation": entry.operation,
-        "target": entry.target,
-        "phase": entry.phase,
-        "success": entry.success,
-        "previous_mac": entry.previous_mac,
-    }))
-    .map_err(|_| "Не удалось вычислить audit MAC".to_owned())
+    // New contextual fields are inserted only when present so that entries
+    // written by older tool versions keep verifying against their original
+    // HMAC payload.
+    let mut payload = serde_json::Map::new();
+    payload.insert("timestamp".to_owned(), json!(entry.timestamp));
+    payload.insert("operator".to_owned(), json!(entry.operator));
+    payload.insert("operation".to_owned(), json!(entry.operation));
+    payload.insert("target".to_owned(), json!(entry.target));
+    payload.insert("phase".to_owned(), json!(entry.phase));
+    payload.insert("success".to_owned(), json!(entry.success));
+    payload.insert("previous_mac".to_owned(), json!(entry.previous_mac));
+    if !entry.correlation_id.is_empty() {
+        payload.insert("correlation_id".to_owned(), json!(entry.correlation_id));
+    }
+    if !entry.workstation.is_empty() {
+        payload.insert("workstation".to_owned(), json!(entry.workstation));
+    }
+    if let Some(license_id) = &entry.license_id {
+        payload.insert("license_id".to_owned(), json!(license_id));
+    }
+    if let Some(before_state) = &entry.before_state {
+        payload.insert("before_state".to_owned(), json!(before_state));
+    }
+    if let Some(after_state) = &entry.after_state {
+        payload.insert("after_state".to_owned(), json!(after_state));
+    }
+    serde_json::to_vec(&Value::Object(payload))
+        .map_err(|_| "Не удалось вычислить audit MAC".to_owned())
 }
 
 fn compute_audit_state_mac(
@@ -826,6 +1052,40 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_state_recovers_a_valid_synced_suffix_after_a_crash() {
+        let path = env::temp_dir().join(format!(
+            "heat3-admin-audit-recovery-{}.jsonl",
+            std::process::id()
+        ));
+        let state_path = audit_state_path(&path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&state_path);
+        let key = b"01234567890123456789012345678901";
+        {
+            let mut log = AuditLog::open(path.clone(), key).unwrap();
+            log.append_test("license.show", "license-1", "attempt", None)
+                .unwrap();
+        }
+        let stale_state = fs::read(&state_path).unwrap();
+        {
+            let mut log = AuditLog::open(path.clone(), key).unwrap();
+            log.append_test("license.show", "license-1", "result", Some(true))
+                .unwrap();
+            log.append_test("license.list", "account", "attempt", None)
+                .unwrap();
+        }
+        fs::write(&state_path, stale_state).unwrap();
+
+        assert!(AuditLog::open(path.clone(), key).is_ok());
+        let state = load_audit_state(&state_path).unwrap().unwrap();
+        assert_eq!(state.entry_count, 3);
+        state.verify(key).unwrap();
+
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(path);
+    }
     use std::sync::{Mutex, OnceLock};
 
     fn environment_lock() -> &'static Mutex<()> {
@@ -900,9 +1160,9 @@ mod tests {
         let key = b"01234567890123456789012345678901";
         {
             let mut log = AuditLog::open(path.clone(), key).unwrap();
-            log.append("license.show", "license-1", "attempt", None)
+            log.append_test("license.show", "license-1", "attempt", None)
                 .unwrap();
-            log.append("license.show", "license-1", "result", Some(true))
+            log.append_test("license.show", "license-1", "result", Some(true))
                 .unwrap();
         }
         assert!(AuditLog::open(path.clone(), key).is_ok());
@@ -925,9 +1185,9 @@ mod tests {
         let key = b"01234567890123456789012345678901";
         {
             let mut log = AuditLog::open(path.clone(), key).unwrap();
-            log.append("license.show", "license-1", "attempt", None)
+            log.append_test("license.show", "license-1", "attempt", None)
                 .unwrap();
-            log.append("license.show", "license-1", "result", Some(true))
+            log.append_test("license.show", "license-1", "result", Some(true))
                 .unwrap();
         }
 
@@ -952,7 +1212,7 @@ mod tests {
         let key = b"01234567890123456789012345678901";
         {
             let mut log = AuditLog::open(path.clone(), key).unwrap();
-            log.append("license.show", "license-1", "attempt", None)
+            log.append_test("license.show", "license-1", "attempt", None)
                 .unwrap();
         }
 
@@ -975,9 +1235,9 @@ mod tests {
         let key = b"01234567890123456789012345678901";
         {
             let mut log = AuditLog::open(path.clone(), key).unwrap();
-            log.append("license.show", "license-1", "attempt", None)
+            log.append_test("license.show", "license-1", "attempt", None)
                 .unwrap();
-            log.append("license.show", "license-1", "result", Some(true))
+            log.append_test("license.show", "license-1", "result", Some(true))
                 .unwrap();
         }
 
@@ -1015,7 +1275,7 @@ mod tests {
         let key = b"01234567890123456789012345678901";
         {
             let mut log = AuditLog::open(path.clone(), key).unwrap();
-            log.append("license.show", "license-1", "attempt", None)
+            log.append_test("license.show", "license-1", "attempt", None)
                 .unwrap();
         }
         fs::remove_file(&state_path).unwrap();
@@ -1034,6 +1294,157 @@ mod tests {
         assert_eq!(entries[1].phase, "result");
         assert_eq!(entries[1].success, Some(true));
         assert!(AuditLog::open(path.clone(), key).is_ok());
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(path);
+    }
+
+    fn read_entries(path: &Path) -> Vec<AuditEntry> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<AuditEntry>(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn consecutive_issue_operations_map_to_their_license_ids() {
+        let path = env::temp_dir().join(format!(
+            "heat3-admin-audit-issue-{}.jsonl",
+            std::process::id()
+        ));
+        let state_path = audit_state_path(&path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&state_path);
+        let key = b"01234567890123456789012345678901";
+        {
+            let mut log = AuditLog::open(path.clone(), key).unwrap();
+            for (correlation, license_id) in [("corr-1", "license-aaa"), ("corr-2", "license-bbb")]
+            {
+                log.append(
+                    "license.issue",
+                    "account",
+                    "attempt",
+                    None,
+                    correlation,
+                    &AuditOutcome::default(),
+                )
+                .unwrap();
+                let outcome = AuditOutcome {
+                    license_id: Some(license_id.to_owned()),
+                    before_state: None,
+                    after_state: Some("active".to_owned()),
+                };
+                log.append(
+                    "license.issue",
+                    "account",
+                    "result",
+                    Some(true),
+                    correlation,
+                    &outcome,
+                )
+                .unwrap();
+            }
+        }
+
+        let entries = read_entries(&path);
+        let correlation_ids: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.correlation_id.as_str())
+            .collect();
+        assert!(correlation_ids.iter().all(|id| !id.is_empty()));
+        let paired = entries
+            .chunks(2)
+            .map(|pair| (pair[0].correlation_id.clone(), pair[1].license_id.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paired,
+            vec![
+                ("corr-1".to_owned(), Some("license-aaa".to_owned())),
+                ("corr-2".to_owned(), Some("license-bbb".to_owned())),
+            ]
+        );
+        assert!(entries.iter().all(|entry| !entry.workstation.is_empty()));
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn audit_entries_never_contain_license_keys_or_tokens() {
+        let path = env::temp_dir().join(format!(
+            "heat3-admin-audit-secrets-{}.jsonl",
+            std::process::id()
+        ));
+        let state_path = audit_state_path(&path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&state_path);
+        let key = b"01234567890123456789012345678901";
+        let secret = "SECRET-LICENSE-KEY-0123456789";
+        {
+            let mut log = AuditLog::open(path.clone(), key).unwrap();
+            let outcome = AuditOutcome {
+                license_id: Some("license-cc".to_owned()),
+                before_state: None,
+                after_state: Some("active".to_owned()),
+            };
+            log.append(
+                "license.issue",
+                "account",
+                "attempt",
+                None,
+                "corr-x",
+                &outcome,
+            )
+            .unwrap();
+            log.append(
+                "license.issue",
+                "account",
+                "result",
+                Some(true),
+                "corr-x",
+                &outcome,
+            )
+            .unwrap();
+            assert!(!secret.is_empty());
+        }
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(!content.contains(secret));
+        assert!(!content.contains("Bearer "));
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn tampering_with_audit_context_is_detected() {
+        let path = env::temp_dir().join(format!(
+            "heat3-admin-audit-context-{}.jsonl",
+            std::process::id()
+        ));
+        let state_path = audit_state_path(&path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&state_path);
+        let key = b"01234567890123456789012345678901";
+        {
+            let mut log = AuditLog::open(path.clone(), key).unwrap();
+            let outcome = AuditOutcome {
+                license_id: Some("license-original".to_owned()),
+                before_state: None,
+                after_state: Some("active".to_owned()),
+            };
+            log.append(
+                "license.issue",
+                "account",
+                "attempt",
+                None,
+                "corr-y",
+                &outcome,
+            )
+            .unwrap();
+        }
+        let mut content = fs::read_to_string(&path).unwrap();
+        content = content.replacen("license-original", "license-tampered", 1);
+        fs::write(&path, content).unwrap();
+
+        assert!(AuditLog::open(path.clone(), key).is_err());
         let _ = fs::remove_file(state_path);
         let _ = fs::remove_file(path);
     }

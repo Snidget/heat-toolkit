@@ -5,7 +5,7 @@ use iced::{Element, Length};
 
 use crate::clipboard;
 use crate::parser::{parse_script, ScriptLine};
-use crate::step_export::write_step;
+use crate::step_export::{is_exportable_solid, write_step};
 
 use super::app::Message;
 use super::preview3d::{self, Canvas3DMessage, Preview3D, StandardView};
@@ -39,7 +39,10 @@ impl Default for Step3DPage {
 impl Step3DPage {
     pub fn sync_lines(&mut self, script: &str) {
         let lines = parse_script(script);
-        self.boxes = lines.iter().filter(|line| line.segment.is_some()).count();
+        self.boxes = lines
+            .iter()
+            .filter(|line| line.label.as_deref() == Some("p") && line.segment.is_some())
+            .count();
         self.lines = lines;
     }
 
@@ -142,16 +145,27 @@ impl Step3DPage {
 pub fn count_boxes(script: &str) -> usize {
     parse_script(script)
         .iter()
-        .filter(|line| line.segment.is_some())
+        .filter(|line| line.label.as_deref() == Some("p") && line.segment.is_some())
         .count()
 }
 pub fn export_script(script: &str) -> Result<String, String> {
     let boxes = parse_script(script)
         .iter()
+        .filter(|line| line.label.as_deref() == Some("p"))
         .filter_map(|line| line.segment.map(|segment| segment.as_tuple()))
         .collect::<Vec<_>>();
     if boxes.is_empty() {
         return Err("Нет данных для экспорта.".to_owned());
+    }
+    let exportable_boxes = boxes
+        .iter()
+        .filter(|box_| is_exportable_solid(box_))
+        .count();
+    let skipped_degenerate_boxes = boxes.len() - exportable_boxes;
+    if exportable_boxes == 0 {
+        return Err(format!(
+            "Нет объёмных тел для экспорта. Пропущено вырожденных объектов: {skipped_degenerate_boxes}."
+        ));
     }
     let path = rfd::FileDialog::new()
         .add_filter("STEP files", &["step", "stp"])
@@ -159,7 +173,14 @@ pub fn export_script(script: &str) -> Result<String, String> {
         .save_file()
         .ok_or_else(|| "Экспорт отменён.".to_owned())?;
     write_step(&path, &boxes)
-        .map(|_| format!("Модель экспортирована: {}", path.display()))
+        .map(|summary| {
+            format!(
+                "Модель экспортирована: {}. Тел: {}; пропущено вырожденных: {}.",
+                path.display(),
+                summary.exported_boxes,
+                summary.skipped_degenerate_boxes
+            )
+        })
         .map_err(|error| format!("Ошибка экспорта STEP: {error}"))
 }
 pub fn paste() -> Result<String, String> {

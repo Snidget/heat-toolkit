@@ -1,5 +1,6 @@
 use heat3_povorotnik::model_check::{
-    count_model_planes, detect_internal_cavities, format_cavity_check,
+    count_model_planes, detect_internal_cavities, format_cavity_check, simplify_proposals,
+    supported_geometry, MergeProposal,
 };
 
 fn box_line(x1: i32, y1: i32, z1: i32, x2: i32, y2: i32, z2: i32, label: &str) -> String {
@@ -90,9 +91,108 @@ fn test_detect_internal_cavities_ignores_volume_connected_to_outside() {
 }
 
 #[test]
+fn test_detect_internal_cavities_treats_empty_box_as_an_enclosed_cutout() {
+    let script = "p 0 0 0 3 3 3 Material\ne 1 1 1 2 2 2";
+
+    let result = detect_internal_cavities(script, 1_000_000);
+
+    assert_eq!(result.cavities.len(), 1);
+    assert_eq!(result.cavities[0].bounds, [1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+}
+
+#[test]
+fn test_detect_internal_cavities_treats_exterior_connected_cutout_as_open() {
+    let script = "p 0 0 0 3 3 3 Material\ne 0 1 1 2 2 2";
+
+    let result = detect_internal_cavities(script, 1_000_000);
+
+    assert!(result.cavities.is_empty());
+}
+
+#[test]
+fn test_detect_internal_cavities_does_not_fill_cutout_with_bc_box() {
+    let script = "p 0 0 0 3 3 3 Material\ne 1 1 1 2 2 2\nb 1 1 1 2 2 2 2";
+
+    let result = detect_internal_cavities(script, 1_000_000);
+
+    assert_eq!(result.cavities.len(), 1);
+    assert_eq!(result.cavities[0].bounds, [1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+}
+
+#[test]
+fn test_detect_internal_cavities_applies_material_and_empty_boxes_in_script_order() {
+    let script = "p 0 0 0 3 3 3 Material\ne 1 1 1 2 2 2\np 1 1 1 2 2 2 Material";
+
+    let result = detect_internal_cavities(script, 1_000_000);
+
+    assert!(result.cavities.is_empty());
+}
+
+#[test]
+fn test_s_material_box_contributes_planes_and_occupancy_like_p() {
+    let p_script = "p 0 0 0 1 1 1 Material\np 0.2 0.2 0.2 0.4 0.4 0.4 Inner";
+    let s_script = "p 0 0 0 1 1 1 Material\ns 0.2 0.2 0.2 0.2 0.2 0.2 Inner";
+
+    let p_usage = count_model_planes(p_script);
+    let s_usage = count_model_planes(s_script);
+    assert_eq!(p_usage.x, s_usage.x);
+    assert_eq!(p_usage.y, s_usage.y);
+    assert_eq!(p_usage.z, s_usage.z);
+    assert_eq!(p_usage.total_objects, s_usage.total_objects);
+}
+
+#[test]
+fn test_s_material_box_fills_cutout_like_an_equivalent_p_box() {
+    // `e` cuts a void, then an `s` material box refills it: no cavity remains.
+    let script = "p 0 0 0 3 3 3 Material\ne 1 1 1 2 2 2\ns 1 1 1 1 1 1 Material";
+    let result = detect_internal_cavities(script, 1_000_000);
+    assert!(result.cavities.is_empty());
+}
+
+#[test]
+fn test_unsupported_geometry_is_reported() {
+    let (_, unsupported) =
+        supported_geometry("p 0 0 0 1 1 1 Material\nc 0 0 0 1 1 1\nh 0 0 0 1 1 1 10");
+    assert_eq!(unsupported, vec!["c".to_owned(), "h".to_owned()]);
+
+    let (items, unsupported) =
+        supported_geometry("p 0 0 0 1 1 1 Material\ns 1 0 0 0.2 1 1 Insulation");
+    assert!(unsupported.is_empty());
+    assert!(items.iter().any(|item| item.label == "s"));
+}
+
+#[test]
 fn test_detect_internal_cavities_skips_large_grid() {
     let result = detect_internal_cavities(&unit_cube_shell_script(false), 10);
     assert!(result.skipped);
     assert!(result.cavities.is_empty());
     assert_eq!(result.cell_count, 27);
+}
+
+fn merge_proposal(axis: &str, coord_from: f64, coord_to: f64) -> MergeProposal {
+    MergeProposal {
+        axis: axis.to_owned(),
+        coord_from,
+        coord_to,
+        gap: (coord_to - coord_from).abs(),
+        changes: Vec::new(),
+    }
+}
+
+#[test]
+fn test_simplify_proposals_revalidates_when_a_prerequisite_is_deselected() {
+    let script = "p 0 0 0 1 1 1 Material";
+    let first = merge_proposal("X", 0.0, -0.06);
+    let second = merge_proposal("X", 1.0, 0.90);
+
+    let all_selected = simplify_proposals(script, &[first.clone(), second.clone()], 100.0, 9.5);
+    assert_eq!(all_selected.applied_count, 2);
+    assert!(all_selected.rejected.is_empty());
+    assert!(all_selected.script.contains("-0.06"));
+    assert!(all_selected.script.contains("0.9"));
+
+    let later_only = simplify_proposals(script, &[second], 100.0, 9.5);
+    assert_eq!(later_only.applied_count, 0);
+    assert_eq!(later_only.rejected.len(), 1);
+    assert_eq!(later_only.script, script);
 }

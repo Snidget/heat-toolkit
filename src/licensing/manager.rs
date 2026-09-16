@@ -52,14 +52,20 @@ impl Default for LicenseManager {
 }
 
 impl LicenseManager {
-    /// True when the binary was compiled with `HEAT3_DEV_LICENSE` set.
-    /// In that mode licensing is simulated: every feature is unlocked and no
-    /// Keygen server is contacted. Never enabled for production builds.
+    /// True only in debug builds compiled with `HEAT3_DEV_LICENSE` set.
+    /// Production builds do not compile the bypass at all.
+    #[cfg(debug_assertions)]
     pub fn development_mode() -> bool {
         option_env!("HEAT3_DEV_LICENSE").is_some()
     }
 
+    #[cfg(not(debug_assertions))]
+    pub const fn development_mode() -> bool {
+        false
+    }
+
     pub fn new() -> Self {
+        #[cfg(debug_assertions)]
         if Self::development_mode() {
             return Self::development();
         }
@@ -80,6 +86,7 @@ impl LicenseManager {
         manager
     }
 
+    #[cfg(debug_assertions)]
     fn development() -> Self {
         let now = unix_now().unwrap_or(0);
         let lease = LicenseLease::new(
@@ -131,13 +138,15 @@ impl LicenseManager {
             license_key.zeroize();
             return false;
         }
-        let key = license_key.trim().to_owned();
+        let mut key = license_key.trim().to_owned();
         license_key.zeroize();
         if key.len() < 8 || key.len() > 7_000 || key.contains(['\r', '\n', '\0']) {
+            key.zeroize();
             self.message = "Check the license key format.".to_owned();
             return false;
         }
         let (Some(config), Some(store)) = (self.config.clone(), self.store.clone()) else {
+            key.zeroize();
             self.message = configuration_message();
             return false;
         };
@@ -212,6 +221,7 @@ impl LicenseManager {
 
     /// Poll from the UI frame; never waits for the network worker.
     pub fn poll(&mut self) -> bool {
+        #[cfg(debug_assertions)]
         if Self::development_mode() {
             return false;
         }
@@ -426,9 +436,15 @@ fn activate_worker(config: KeygenConfig, store: SecureStore, mut key: String) ->
         Ok(current) => current,
         Err(_) => return failure_result(WorkerFailure::Storage, Some(masked)),
     };
+    let client = match KeygenClient::new(config) {
+        Ok(client) => client,
+        Err(error) => return failure_result(WorkerFailure::Client(error), Some(masked)),
+    };
+    // Tracks a machine created by *this* attempt so it can be rolled back if a
+    // later step fails before the local record is committed.
+    let mut created_machine: Option<String> = None;
     let result = (|| -> Result<WorkerResult, WorkerFailure> {
         let hardware = collect_hardware_identity().map_err(|_| WorkerFailure::Hardware)?;
-        let client = KeygenClient::new(config).map_err(WorkerFailure::Client)?;
         let first = client
             .validate_key(&key, &hardware)
             .map_err(WorkerFailure::Client)?;
@@ -447,9 +463,13 @@ fn activate_worker(config: KeygenConfig, store: SecureStore, mut key: String) ->
             .map_err(WorkerFailure::Client)?
         {
             Some(machine) => machine,
-            None => client
-                .activate_machine(&key, &license_id, &hardware, &computer_name())
-                .map_err(WorkerFailure::Client)?,
+            None => {
+                let machine = client
+                    .activate_machine(&key, &license_id, &hardware, &computer_name())
+                    .map_err(WorkerFailure::Client)?;
+                created_machine = Some(machine.machine_id.clone());
+                machine
+            }
         };
         let validation = client
             .validate_key(&key, &hardware)
@@ -509,6 +529,13 @@ fn activate_worker(config: KeygenConfig, store: SecureStore, mut key: String) ->
             Err(_) => Err(WorkerFailure::Storage),
         }
     })();
+    if result.is_err() {
+        if let Some(machine_id) = &created_machine {
+            // Compensating cleanup: the activation never committed locally, so
+            // the server-side machine must not linger and consume a slot.
+            let _ = client.deactivate_machine(&key, machine_id);
+        }
+    }
     key.zeroize();
     match result {
         Ok(worker_result) => worker_result,
@@ -536,7 +563,17 @@ fn refresh_worker(config: KeygenConfig, store: SecureStore) -> WorkerResult {
         ) {
             return Err(WorkerFailure::Hardware);
         }
-        let client = KeygenClient::new(config).map_err(WorkerFailure::Client)?;
+        // When the local clock is known to have rolled back behind the trusted
+        // floor, authenticate the server response without trusting the local
+        // clock for freshness. The signed server time then repairs the floor.
+        let clock_rollback = unix_now()
+            .map(|now| {
+                now.saturating_add(CLOCK_ROLLBACK_TOLERANCE) < record.max_observed_trusted_time()
+            })
+            .unwrap_or(false);
+        let client = KeygenClient::new(config)
+            .map_err(WorkerFailure::Client)?
+            .with_clock_recovery(clock_rollback);
         let validation = client
             .validate_key(record.license_key(), &hardware)
             .map_err(WorkerFailure::Client)?;
@@ -648,6 +685,16 @@ fn deactivate_worker(config: KeygenConfig, store: SecureStore) -> WorkerResult {
         Err(error) if deactivation_already_completed(&error) => {
             deactivation_success_result(&store, &record)
         }
+        Err(error) if deactivation_outcome_is_ambiguous(&error) => {
+            // The DELETE may have committed on Keygen even though we could not
+            // confirm it. Keep the fail-closed pending marker so the local
+            // offline lease cannot be restored until an authoritative refresh.
+            WorkerResult {
+                state: LicenseState::NeedsOnline(NeedsOnlineReason::RefreshRequired),
+                masked_key: Some(mask_license_key(record.license_key())),
+                message: "Deactivation outcome is unconfirmed by the server. Online confirmation is required.".to_owned(),
+            }
+        }
         Err(_error) => match clear_deactivation_pending(&store, &record) {
             Ok(Some(current)) => local_record_result(
                 &current,
@@ -659,11 +706,21 @@ fn deactivate_worker(config: KeygenConfig, store: SecureStore) -> WorkerResult {
                 Some(mask_license_key(record.license_key())),
             ),
         },
-
-
-
-
     }
+}
+
+/// True when the machine DELETE may have reached/committed on Keygen but the
+/// client cannot know the outcome. Only local, pre-send validation errors and
+/// an explicit 404 (already deleted) are treated as definite.
+fn deactivation_outcome_is_ambiguous(error: &KeygenClientError) -> bool {
+    !matches!(
+        error,
+        KeygenClientError::InvalidConfiguration
+            | KeygenClientError::InvalidLicenseKey
+            | KeygenClientError::InvalidResourceId
+            | KeygenClientError::InvalidHardwareIdentity
+            | KeygenClientError::MissingBuildConfiguration
+    )
 }
 
 fn deactivation_success_result(store: &SecureStore, record: &SecureLicenseRecord) -> WorkerResult {
@@ -997,6 +1054,12 @@ fn configuration_message() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn development_license_bypass_is_disabled_in_release() {
+        assert!(!LicenseManager::development_mode());
+    }
+
     use super::*;
     use crate::licensing::{
         AccessMode, HardwareComponent, HardwareComponentKind, HARDWARE_SCHEMA_VERSION,
@@ -1396,6 +1459,43 @@ mod tests {
             status: 503,
             code: None,
         }));
+    }
+
+    #[test]
+    fn ambiguous_deactivation_errors_keep_the_pending_marker() {
+        // Network/response outcomes we cannot interpret keep the fail-closed
+        // pending marker.
+        for error in [
+            KeygenClientError::Timeout,
+            KeygenClientError::Connection,
+            KeygenClientError::Transport,
+            KeygenClientError::InvalidResponse,
+            KeygenClientError::ResponseTooLarge,
+            KeygenClientError::Api {
+                status: 503,
+                code: None,
+            },
+            KeygenClientError::Api {
+                status: 429,
+                code: None,
+            },
+        ] {
+            assert!(
+                deactivation_outcome_is_ambiguous(&error),
+                "{error:?} must stay pending"
+            );
+        }
+        // Local validation errors mean the request was never sent.
+        for error in [
+            KeygenClientError::InvalidConfiguration,
+            KeygenClientError::InvalidLicenseKey,
+            KeygenClientError::InvalidResourceId,
+        ] {
+            assert!(
+                !deactivation_outcome_is_ambiguous(&error),
+                "{error:?} may clear pending"
+            );
+        }
     }
 
     #[test]

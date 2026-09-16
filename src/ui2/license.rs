@@ -15,6 +15,20 @@ pub struct LicensePage {
 }
 
 impl LicensePage {
+    pub fn set_key(&mut self, new_key: String) {
+        use zeroize::Zeroize;
+        self.key.zeroize();
+        self.key = new_key;
+    }
+
+    pub fn clear_key(&mut self) {
+        use zeroize::Zeroize;
+        self.key.zeroize();
+        self.key.clear();
+    }
+}
+
+impl LicensePage {
     pub fn view(&self, snapshot: LicenseManagerSnapshot) -> Element<'_, Message> {
         let mut content = column![].spacing(theme::PAGE_SPACING);
         content = content.push(status_panel(&snapshot));

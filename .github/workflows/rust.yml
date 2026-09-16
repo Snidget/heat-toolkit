@@ -3,6 +3,7 @@ name: Rust CI
 on:
   push:
     branches: [main, master, develop]
+    tags: ["v*"]
     paths:
       - ".github/workflows/rust.yml"
       - "README.md"
@@ -19,6 +20,7 @@ on:
       - "tools/check-source-hygiene.ps1"
       - "tools/license-admin/**"
       - "tools/release/**"
+  workflow_dispatch:
   pull_request:
     branches: [main, master, develop]
     paths:
@@ -54,7 +56,7 @@ jobs:
       - name: Install minimum supported Rust
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
-          toolchain: "1.88.0"
+          toolchain: "1.90.0"
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
@@ -138,7 +140,14 @@ jobs:
         env:
           HEAT3_KEYGEN_ADMIN_TOKEN: "__HEAT3_CI_SECRET_SENTINEL__"
           HEAT3_KEYGEN_PRODUCT_TOKEN: "__HEAT3_CI_SECRET_SENTINEL__"
+          HEAT3_DEV_LICENSE: "__HEAT3_CI_DEV_LICENSE_SENTINEL__"
         run: cargo build --release --locked
+
+      - name: Verify the development license bypass is disabled in release builds
+        shell: pwsh
+        env:
+          HEAT3_DEV_LICENSE: "__HEAT3_CI_DEV_LICENSE_SENTINEL__"
+        run: cargo test --release --locked development_license_bypass_is_disabled_in_release
 
       - name: Fail if a secret is embedded in the client binary
         shell: pwsh
@@ -150,17 +159,27 @@ jobs:
           if ($text.Contains($sentinel)) {
             throw "Admin/product token leaked into the client binary."
           }
+          $devLicenseSentinel = '__HEAT3_CI_DEV_LICENSE_SENTINEL__'
+          if ($text.Contains($devLicenseSentinel)) {
+            throw "Development license bypass leaked into the client binary."
+          }
           Write-Output "No embedded secrets in the client binary."
 
   release-sign:
     runs-on: windows-latest
-    needs: rust-client
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    needs: [rust-client, release-secret-scan]
     defaults:
       run:
         working-directory: ${{ github.workspace }}
     env:
       HEAT3_CODESIGN_CERT_BASE64: ${{ secrets.HEAT3_CODESIGN_CERT_BASE64 }}
       HEAT3_CODESIGN_CERT_PASSWORD: ${{ secrets.HEAT3_CODESIGN_CERT_PASSWORD }}
+      HEAT3_KEYGEN_API_URL: ${{ vars.HEAT3_KEYGEN_API_URL }}
+      HEAT3_KEYGEN_ACCOUNT_ID: ${{ vars.HEAT3_KEYGEN_ACCOUNT_ID }}
+      HEAT3_KEYGEN_PRODUCT_ID: ${{ vars.HEAT3_KEYGEN_PRODUCT_ID }}
+      HEAT3_KEYGEN_POLICY_ID: ${{ vars.HEAT3_KEYGEN_POLICY_ID }}
+      HEAT3_KEYGEN_PUBLIC_KEY: ${{ vars.HEAT3_KEYGEN_PUBLIC_KEY }}
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -173,24 +192,48 @@ jobs:
         with:
           workspaces: .
 
-      - name: Build release client
-        shell: pwsh
-        run: cargo build --release --locked
-
-      - name: Sign and package the release
-        if: env.HEAT3_CODESIGN_CERT_BASE64 != ''
-        shell: pwsh
-        run: .\tools\release\sign-and-package.ps1 -SkipIfNoCert
-
-      - name: Report unsigned build
-        if: env.HEAT3_CODESIGN_CERT_BASE64 == ''
+      - name: Require release configuration
         shell: pwsh
         run: |
-          Write-Output "No code-signing certificate configured (HEAT3_CODESIGN_CERT_BASE64)."
-          Write-Output "Release is UNSIGNED; set the secret and rerun for an Authenticode-signed package."
+          if ([string]::IsNullOrWhiteSpace($env:HEAT3_CODESIGN_CERT_BASE64) -or [string]::IsNullOrWhiteSpace($env:HEAT3_CODESIGN_CERT_PASSWORD)) {
+            throw "Trusted release signing requires HEAT3_CODESIGN_CERT_BASE64 and HEAT3_CODESIGN_CERT_PASSWORD."
+          }
+          $requiredKeygenVariables = "HEAT3_KEYGEN_API_URL", "HEAT3_KEYGEN_ACCOUNT_ID", "HEAT3_KEYGEN_PRODUCT_ID", "HEAT3_KEYGEN_POLICY_ID", "HEAT3_KEYGEN_PUBLIC_KEY"
+          foreach ($variable in $requiredKeygenVariables) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($variable))) {
+              throw "Trusted release build requires the GitHub variable $variable."
+            }
+          }
+
+      - name: Enforce release version matches Cargo and tag
+        shell: pwsh
+        run: |
+          $cargoVersion = (Select-String -LiteralPath "Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value.Trim()
+          $refName = $env:GITHUB_REF_NAME
+          if ($refName -and $refName.StartsWith("v")) {
+            $tagVersion = $refName.Substring(1)
+            if ($tagVersion -ne $cargoVersion) {
+              throw "Tag $refName does not match Cargo version $cargoVersion — update Cargo.toml or tag before release."
+            }
+            Write-Output "Version check: tag $refName matches Cargo $cargoVersion"
+          } else {
+            Write-Output "Version check: non-tag build, Cargo $cargoVersion"
+          }
+          if (-not (Select-String -LiteralPath "src/ui2/platform.rs" -Pattern 'env!\("CARGO_PKG_VERSION"\)')) {
+            throw "WINDOW_TITLE must derive from env!(""CARGO_PKG_VERSION"")"
+          }
+
+      - name: Build and verify release client configuration
+        shell: pwsh
+        run: |
+          cargo build --release --locked
+          cargo test --release --locked release_compile_time_configuration_is_valid
+
+      - name: Sign and package the release
+        shell: pwsh
+        run: .\tools\release\sign-and-package.ps1
 
       - name: Upload release package
-        if: env.HEAT3_CODESIGN_CERT_BASE64 != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: heat3-povorotnik-release

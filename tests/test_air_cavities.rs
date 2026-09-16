@@ -1,6 +1,6 @@
 use heat3_povorotnik::air_cavities::{
     build_air_cavity_materials, format_air_cavity_name, parse_air_cavities_info_log,
-    upsert_air_cavity_materials, DEFAULT_AIR_CAVITY_NAME_MASK,
+    preflight_air_cavity_upsert, upsert_air_cavity_materials, DEFAULT_AIR_CAVITY_NAME_MASK,
 };
 use heat3_povorotnik::material_sort::{parse_mtl_file, write_mtl_file, MtlMaterial};
 
@@ -41,6 +41,17 @@ fn test_parse_air_cavities_info_log_rejects_missing_matching_dimensions() {
     let result = parse_air_cavities_info_log(log);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("нет"));
+}
+
+#[test]
+fn test_parse_air_cavities_info_log_rejects_non_finite_values() {
+    for value in ["NaN", "inf", "-inf"] {
+        let log = SAMPLE_LOG.replacen("130", value, 1);
+        assert!(
+            parse_air_cavities_info_log(&log).is_err(),
+            "expected {value} to be rejected"
+        );
+    }
 }
 
 #[test]
@@ -95,11 +106,60 @@ fn test_format_air_cavity_name_rejects_unknown_field() {
 }
 
 #[test]
+fn test_format_air_cavity_name_rejects_unsafe_format_specs_before_formatting() {
+    let cavities = parse_air_cavities_info_log(SAMPLE_LOG).unwrap();
+    for mask in ["Air {n:.0g}", "Air {n:999999d}", "Air {n:.999999f}"] {
+        assert!(
+            format_air_cavity_name(mask, &cavities[0]).is_err(),
+            "expected {mask:?} to be rejected"
+        );
+    }
+    assert_eq!(
+        format_air_cavity_name("Air {n:03d} {lambda:.2f}", &cavities[0]).as_deref(),
+        Ok("Air 001 0.34")
+    );
+}
+
+#[test]
 fn test_build_air_cavity_materials_rejects_duplicate_generated_names() {
     let cavities = parse_air_cavities_info_log(SAMPLE_LOG).unwrap();
     let result = build_air_cavity_materials(&cavities, "Air", (10, 20, 30), 7);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("дублиру"));
+}
+
+#[test]
+fn test_preflight_reports_replacements_before_mutating() {
+    let dir = std::env::temp_dir();
+    let path = dir.join("test_air_cavity_preflight.mtl");
+
+    write_mtl_file(
+        &path,
+        &[MtlMaterial {
+            name: "Air 1".to_string(),
+            thermal_x: 9.0,
+            thermal_y: 9.0,
+            volume_heat: 9.0,
+            rgb_r: 9,
+            rgb_g: 9,
+            rgb_b: 9,
+            special_value: 9,
+        }],
+    )
+    .unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    let cavities = parse_air_cavities_info_log(SAMPLE_LOG).unwrap();
+    let specs = build_air_cavity_materials(&cavities, "Air [номер]", (10, 20, 30), 7).unwrap();
+    let preflight = preflight_air_cavity_upsert(&path, &specs).unwrap();
+
+    assert!(preflight.has_replacements());
+    assert_eq!(preflight.replaced, vec!["Air 1"]);
+    assert_eq!(preflight.added, vec!["Air 2"]);
+    // Preflight must not mutate the file.
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    std::fs::remove_file(&path).ok();
 }
 
 #[test]

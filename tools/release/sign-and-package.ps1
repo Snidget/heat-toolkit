@@ -49,6 +49,13 @@ if (-not $Version) {
     }
 }
 
+if ($env:GITHUB_REF_NAME -and $env:GITHUB_REF_NAME.StartsWith("v")) {
+    $tagVersion = $env:GITHUB_REF_NAME.Substring(1)
+    if ($Version -ne $tagVersion) {
+        throw "Version $Version from Cargo.toml does not match tag $env:GITHUB_REF_NAME — refusing to sign/package."
+    }
+}
+
 $cert = $null
 $pfxPath = Join-Path $env:TEMP ("heat3-codesign-" + [guid]::NewGuid().ToString("N") + ".pfx")
 function Invoke-Sign {
@@ -104,7 +111,7 @@ try {
         $wixOut = Join-Path $env:TEMP ("heat3-wix-" + [guid]::NewGuid().ToString("N"))
         New-Item -ItemType Directory -Force -Path $wixOut | Out-Null
         try {
-            & $candle "-dHeat3Exe=$binary" "-dHeat3Version=$Version" -out "$wixOut\" $wxsPath
+            & $candle -arch x64 "-dHeat3Exe=$binary" "-dHeat3Version=$Version" -out "$wixOut\" $wxsPath
             if ($LASTEXITCODE -ne 0) {
                 throw "candle failed with exit code $LASTEXITCODE"
             }

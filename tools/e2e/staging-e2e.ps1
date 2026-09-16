@@ -168,9 +168,9 @@ try {
 
     $r5 = Invoke-Probe @("verify-offline", $licenseKey, $licenseId, $machineId, $certPath)
     if ($r5.Code -eq 0) {
-        Add-Result 11 "Tampered JSON/signature/digest rejected" "PASS" "offline verify of live machine file ok"
+        Add-Result 11 "Valid offline certificate verifies" "PASS" "offline verify of live machine file ok"
     } else {
-        Add-Result 11 "Tampered JSON/signature/digest rejected" "FAIL" "offline verify exit $($r5.Code)"
+        Add-Result 11 "Valid offline certificate verifies" "FAIL" "offline verify exit $($r5.Code)"
     }
 
     $tamperedPath = $certPath + ".tampered"
@@ -224,11 +224,10 @@ try {
         $r12 = Invoke-Probe @("expect-network-failure", $licenseKey, $licenseId, $machineId)
         if ($r12.Code -eq 0) {
             Add-Result 13 "Keygen 5xx/timeout with valid lease: old TTL kept" "PASS" "transport failure mapped to Timeout/Connection/Transport"
-            Add-Result 14 "Keygen 5xx/timeout without lease: fail closed" "PASS" "same error mapping; lease absence is a UI/state-machine path"
         } else {
             Add-Result 13 "Keygen 5xx/timeout with valid lease: old TTL kept" "FAIL" "expect-network-failure exit $($r12.Code)"
-            Add-Result 14 "Keygen 5xx/timeout without lease: fail closed" "FAIL" "expect-network-failure exit $($r12.Code)"
         }
+        Add-Result 14 "Keygen 5xx/timeout without lease: fail closed" "MANUAL" "requires a genuine no-cached-lease UI/state-machine run"
     }
     finally {
         $env:HEAT3_E2E_API_URL = $previousApiUrl
@@ -251,12 +250,12 @@ try {
         if ($clientText.Contains($env:HEAT3_KEYGEN_ADMIN_TOKEN)) { $leaks += "admin token" }
         if ($clientText.Contains($licenseKey)) { $leaks += "issued license key" }
         if ($leaks.Count -eq 0) {
-            Add-Result 18 "Secrets absent from release artifact and logs" "PASS" "no admin token / license key in client binary"
+            Add-Result 18 "Secrets absent from release client binary" "PASS" "no admin token / license key in client binary"
         } else {
-            Add-Result 18 "Secrets absent from release artifact and logs" "FAIL" ("leaked: " + ($leaks -join ", "))
+            Add-Result 18 "Secrets absent from release client binary" "FAIL" ("leaked: " + ($leaks -join ", "))
         }
     } else {
-        Add-Result 18 "Secrets absent from release artifact and logs" "MANUAL" "pass -ClientExe to scan the binary"
+        Add-Result 18 "Secrets absent from release client binary" "MANUAL" "pass -ClientExe to scan the binary"
     }
 
     Write-Host "== Revoke and verify the key dies =="

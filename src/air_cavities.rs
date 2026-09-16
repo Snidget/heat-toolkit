@@ -10,6 +10,7 @@ use crate::material_sort::{
 
 pub const DEFAULT_AIR_CAVITY_NAME_MASK: &str = "Прослойка {n:03d}";
 pub const ALLOWED_NAME_FIELDS: &[&str] = &["n", "b", "d", "area", "lambda", "lam"];
+const MAX_FORMAT_WIDTH_OR_PRECISION: usize = 32;
 
 pub fn simple_name_tokens() -> &'static HashMap<&'static str, &'static str> {
     static MAP: OnceLock<HashMap<&'static str, &'static str>> = OnceLock::new();
@@ -114,7 +115,7 @@ fn parse_positive_float(value: &str, label: &str) -> Result<f64, String> {
         .replace(',', ".")
         .parse::<f64>()
         .map_err(|_| format!("{}: некорректное число {:?}.", label, value))?;
-    if parsed <= 0.0 {
+    if !parsed.is_finite() || parsed <= 0.0 {
         return Err(format!("{}: значение должно быть больше 0.", label));
     }
     Ok(parsed)
@@ -397,6 +398,70 @@ enum NameMaskPart {
     Field { name: String, spec: String },
 }
 
+fn parse_bounded_format_number(value: &str, label: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("Некорректный {label} в спецификаторе формата маски имени."))?;
+    if parsed > MAX_FORMAT_WIDTH_OR_PRECISION {
+        return Err(format!(
+            "{label} в спецификаторе формата маски имени не должен превышать {MAX_FORMAT_WIDTH_OR_PRECISION}."
+        ));
+    }
+    Ok(parsed)
+}
+
+fn validate_format_spec(spec: &str) -> Result<(), String> {
+    if spec.is_empty() {
+        return Ok(());
+    }
+    let Some(format_type) = spec.chars().last() else {
+        return Ok(());
+    };
+    let body = &spec[..spec.len() - format_type.len_utf8()];
+    match format_type {
+        'd' | 'i' | 'u' => {
+            if body.is_empty() {
+                return Ok(());
+            }
+            if !body.chars().all(|character| character.is_ascii_digit()) {
+                return Err(
+                    "Поддерживаются только целочисленная ширина и d/i/u в маске имени.".to_string(),
+                );
+            }
+            parse_bounded_format_number(body, "ширина")?;
+        }
+        'f' | 'F' | 'e' | 'E' | 'g' | 'G' => {
+            if body.is_empty() {
+                return Ok(());
+            }
+            let Some(precision) = body.strip_prefix('.') else {
+                return Err(
+                    "Для f/e/g в маске имени поддерживается только точность вида .N.".to_string(),
+                );
+            };
+            if precision.is_empty()
+                || !precision
+                    .chars()
+                    .all(|character| character.is_ascii_digit())
+            {
+                return Err(
+                    "Некорректная точность в спецификаторе формата маски имени.".to_string()
+                );
+            }
+            let precision = parse_bounded_format_number(precision, "точность")?;
+            if matches!(format_type, 'g' | 'G') && precision == 0 {
+                return Err("Точность g/G в маске имени должна быть больше 0.".to_string());
+            }
+        }
+        _ => {
+            return Err(
+                "Поддерживаются только спецификаторы d/i/u/f/e/g в маске имени.".to_string(),
+            )
+        }
+    }
+    Ok(())
+}
+
 fn parse_name_mask(format_mask: &str) -> Result<Vec<NameMaskPart>, String> {
     let mut parts = Vec::new();
     let mut literal = String::new();
@@ -454,6 +519,7 @@ fn parse_name_mask(format_mask: &str) -> Result<Vec<NameMaskPart>, String> {
                         "\u{41d}\u{435}\u{438}\u{437}\u{432}\u{435}\u{441}\u{442}\u{43d}\u{43e}\u{435} \u{43f}\u{43e}\u{43b}\u{435} \u{43c}\u{430}\u{441}\u{43a}\u{438} {{{name}}}. \u{414}\u{43e}\u{441}\u{442}\u{443}\u{43f}\u{43d}\u{43e}: {allowed}."
                     ));
                 }
+                validate_format_spec(spec)?;
                 parts.push(NameMaskPart::Field {
                     name: name.to_string(),
                     spec: spec.to_string(),
@@ -596,6 +662,55 @@ fn validate_uint8(value: i32, label: &str) -> Result<u8, String> {
             label
         )),
     }
+}
+
+/// Prospective effect of an Air Cavities upsert, computed before any write.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MtlUpsertPreflight {
+    pub added: Vec<String>,
+    pub replaced: Vec<String>,
+}
+
+impl MtlUpsertPreflight {
+    pub fn has_replacements(&self) -> bool {
+        !self.replaced.is_empty()
+    }
+}
+
+/// Compares generated cavity materials against the existing MTL without
+/// mutating it. `replaced` lists existing records that would be overwritten
+/// because their normalized name matches a generated material name.
+pub fn preflight_air_cavity_upsert(
+    path: &Path,
+    specs: &[AirCavityMaterialSpec],
+) -> Result<MtlUpsertPreflight, String> {
+    if specs.is_empty() {
+        return Err("Нет материалов для записи.".to_string());
+    }
+    let mut new_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for spec in specs {
+        let key = normalize_material_name(&spec.material.name);
+        if !new_keys.insert(key) {
+            return Err("Список материалов содержит дублирующиеся имена.".to_string());
+        }
+    }
+    let records = parse_mtl_records(path, true)
+        .map_err(|e| format!("Не удалось прочитать .MTL файл: {}", e))?;
+    let existing_keys: std::collections::HashSet<String> = records
+        .iter()
+        .map(|record| normalize_material_name(&record.material.name))
+        .collect();
+    let replaced: Vec<String> = specs
+        .iter()
+        .filter(|spec| existing_keys.contains(&normalize_material_name(&spec.material.name)))
+        .map(|spec| spec.material.name.clone())
+        .collect();
+    let added: Vec<String> = specs
+        .iter()
+        .filter(|spec| !existing_keys.contains(&normalize_material_name(&spec.material.name)))
+        .map(|spec| spec.material.name.clone())
+        .collect();
+    Ok(MtlUpsertPreflight { added, replaced })
 }
 
 pub fn upsert_air_cavity_materials(

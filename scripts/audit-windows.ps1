@@ -1,11 +1,5 @@
 $ErrorActionPreference = "Stop"
 
-$metadata = & cargo metadata --format-version 1 --no-deps | ConvertFrom-Json
-$features = $metadata.packages | Where-Object { $_.name -eq "heat3_povorotnik" } | Select-Object -ExpandProperty features
-if (-not ($features.PSObject.Properties.Name -contains "ui-iced")) {
-    throw "ui-iced feature is missing from the client package"
-}
-
 function Assert-TargetGraphDoesNotContain {
     param(
         [Parameter(Mandatory = $true)][string]$Spec,
@@ -23,14 +17,15 @@ function Assert-TargetGraphDoesNotContain {
     }
 }
 
+# RUSTSEC-2026-0194 and RUSTSEC-2026-0195 affect quick-xml before 0.41.0.
+# cargo-audit cannot filter by target, so both advisories are ignored only after
+# proving that no quick-xml version is reachable from the Windows client graph.
 Assert-TargetGraphDoesNotContain -Spec "quick-xml" -DisplayName "quick-xml"
-Assert-TargetGraphDoesNotContain -Spec "memmap2@0.5.10" -DisplayName "memmap2"
 
 & cargo audit `
     --file Cargo.lock `
     --ignore RUSTSEC-2026-0194 `
-    --ignore RUSTSEC-2026-0195 `
-    --ignore RUSTSEC-2026-0186
+    --ignore RUSTSEC-2026-0195
 
 if ($LASTEXITCODE -ne 0) {
     throw "cargo audit failed"

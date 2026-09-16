@@ -77,6 +77,24 @@ fn material_name_from_trailing(trailing: &str) -> String {
     crate::material_sort::material_name_from_trailing(trailing)
 }
 
+fn scene_segments(
+    lines: &[ScriptLine],
+    material_colors: &HashMap<String, Color>,
+) -> Vec<(Segment, Color)> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let segment = line.segment?;
+            let default_fill = shape_color_solid(label_char(line));
+            let fill = material_colors
+                .get(&material_name_from_trailing(&line.trailing))
+                .copied()
+                .unwrap_or(default_fill);
+            Some((segment, fill))
+        })
+        .collect()
+}
+
 #[derive(Default)]
 pub struct Preview3DState {
     pub drag_origin: Option<Point>,
@@ -153,7 +171,13 @@ impl Camera {
 }
 
 /// Центр и радиус сцены по всем сегментам.
+#[allow(dead_code)]
 fn scene_bounds(lines: &[ScriptLine]) -> Option<([f64; 3], f64)> {
+    world_aabb(lines).map(|(_min, _max, center, radius)| (center, radius))
+}
+
+#[allow(clippy::type_complexity)]
+fn world_aabb(lines: &[ScriptLine]) -> Option<([f64; 3], [f64; 3], [f64; 3], f64)> {
     let mut min = [f64::INFINITY; 3];
     let mut max = [f64::NEG_INFINITY; 3];
     let mut any = false;
@@ -179,7 +203,7 @@ fn scene_bounds(lines: &[ScriptLine]) -> Option<([f64; 3], f64)> {
     for i in 0..3 {
         radius = radius.max(max[i] - min[i]);
     }
-    Some((center, (radius * 0.5).max(1e-6)))
+    Some((min, max, center, (radius * 0.5).max(1e-6)))
 }
 
 fn build_camera(
@@ -188,8 +212,8 @@ fn build_camera(
     elevation: f64,
     bounds: Rectangle,
 ) -> Option<(Camera, [f64; 3], f64)> {
-    let (center, radius) = scene_bounds(lines)?;
-    let el = elevation.clamp(-1.45, 1.45);
+    let (min, max, center, radius) = world_aabb(lines)?;
+    let el = elevation.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
     let dir = (el.cos() * azimuth.sin(), el.sin(), el.cos() * azimuth.cos());
 
     let dist = radius * 6.0 + 1.0;
@@ -209,13 +233,39 @@ fn build_camera(
     };
     let (ux, uy, uz) = cross((rx, ry, rz), (fx, fy, fz));
 
+    // Projection-aware fit: evaluate 8 AABB corners in camera right/up basis.
+    let mut max_vx: f64 = 0.0;
+    let mut max_vy: f64 = 0.0;
+    let mut max_vz: f64 = 0.0;
+    for &x in &[min[0], max[0]] {
+        for &y in &[min[1], max[1]] {
+            for &z in &[min[2], max[2]] {
+                let dx = x - center[0];
+                let dy = y - center[1];
+                let dz = z - center[2];
+                let vx = (dx * rx + dy * ry + dz * rz).abs();
+                let vy = (dx * ux + dy * uy + dz * uz).abs();
+                let vz = (dx * fx + dy * fy + dz * fz).abs();
+                max_vx = max_vx.max(vx);
+                max_vy = max_vy.max(vy);
+                max_vz = max_vz.max(vz);
+            }
+        }
+    }
     let w = bounds.width.max(1.0) as f64;
     let h = bounds.height.max(1.0) as f64;
     let aspect = w / h;
-    let half_h = (radius / aspect).max(radius) * 1.15;
-    let half_w = half_h * aspect;
-    let near = (dist - radius * 3.0).max(0.1);
-    let far = dist + radius * 3.0;
+    let mut half_h_needed = max_vy.max(max_vx / aspect);
+    let mut half_w_needed = half_h_needed * aspect;
+    // Fallback for degenerate bounds already handled by radius, but keep epsilon.
+    half_h_needed = half_h_needed.max(1e-6);
+    half_w_needed = half_w_needed.max(1e-6);
+    let margin = 1.15;
+    let half_h = half_h_needed * margin;
+    let half_w = half_w_needed * margin;
+    let half_depth = max_vz.max(radius * 0.5).max(1e-6);
+    let near = (dist - half_depth * 1.5 - 1.0).max(0.1);
+    let far = dist + half_depth * 1.5 + 1.0;
 
     Some((
         Camera {
@@ -247,36 +297,13 @@ fn project_scene(
         return Vec::new();
     };
 
-    let segments: Vec<(char, Segment, Color)> = lines
-        .iter()
-        .filter_map(|line| line.segment.map(|segment| (label_char(line), segment)))
-        .map(|(label, segment)| {
-            let default_fill = shape_color_solid(label);
-            let fill = if material_colors.is_empty() {
-                default_fill
-            } else {
-                let key = material_name_from_trailing(
-                    lines
-                        .iter()
-                        .find(|line| line.segment == Some(segment))
-                        .map(|line| line.trailing.as_str())
-                        .unwrap_or(""),
-                );
-                if key.is_empty() {
-                    default_fill
-                } else {
-                    material_colors.get(&key).copied().unwrap_or(default_fill)
-                }
-            };
-            (label, segment, fill)
-        })
-        .collect();
+    let segments = scene_segments(lines, material_colors);
     if segments.is_empty() {
         return Vec::new();
     }
 
     let mut faces = Vec::new();
-    for (_, segment, fill) in &segments {
+    for (segment, fill) in &segments {
         for face in box_faces(*segment, *fill, &light) {
             let [v0, v1, v2, v3] = face.vertices;
             let mut out = [[0.0f64; 2]; 4];
@@ -567,6 +594,47 @@ impl<'a> canvas::Program<Canvas3DMessage> for Preview3D<'a> {
             iced::mouse::Interaction::Grabbing
         } else {
             iced::mouse::Interaction::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_geometry_keeps_each_lines_material_color() {
+        let lines = vec![
+            crate::parser::parse_line("p 0 0 0 1 1 1 Red ! material box"),
+            crate::parser::parse_line("p 0 0 0 1 1 1 Blue ! material box"),
+        ];
+        let red = Color::from_rgb(1.0, 0.0, 0.0);
+        let blue = Color::from_rgb(0.0, 0.0, 1.0);
+        let colors = HashMap::from([("red".to_owned(), red), ("blue".to_owned(), blue)]);
+
+        let segments = scene_segments(&lines, &colors);
+
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].1, red);
+        assert_eq!(segments[1].1, blue);
+    }
+
+    #[test]
+    fn top_and_bottom_views_are_axis_aligned() {
+        let lines = vec![crate::parser::parse_line("p 0 0 0 1 1 1 material")];
+        let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(400.0, 300.0));
+
+        for (view, expected_y) in [(StandardView::Top, 1.0), (StandardView::Bottom, -1.0)] {
+            let (azimuth, elevation) = standard_view_angles(view);
+            let (camera, center, _) = build_camera(&lines, azimuth, elevation, bounds).unwrap();
+            let camera_y = camera.position[1] - center[1];
+
+            assert!((camera.position[0] - center[0]).abs() < 1e-12);
+            assert!((camera.position[2] - center[2]).abs() < 1e-12);
+            assert!(camera_y * expected_y > 0.0);
+            assert!(camera.forward[0].abs() < 1e-12);
+            assert!((camera.forward[1] + expected_y).abs() < 1e-12);
+            assert!(camera.forward[2].abs() < 1e-12);
         }
     }
 }

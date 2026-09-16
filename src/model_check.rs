@@ -63,31 +63,91 @@ impl CavityCheckResult {
     }
 }
 
-fn normalize_plane(value: f64) -> String {
-    // Python: f"{value:.10g}" с обнулением значений < 1e-12
-    let v = if value.abs() < 1e-12 { 0.0 } else { value };
+fn canonical_plane(value: f64) -> f64 {
+    if value == 0.0 {
+        0.0
+    } else {
+        value
+    }
+}
+
+fn plane_key(value: f64) -> u64 {
+    canonical_plane(value).to_bits()
+}
+
+fn format_plane_display(value: f64) -> String {
+    let v = canonical_plane(value);
     crate::text::format_g(v, 10)
 }
 
-pub fn count_model_planes(script_text: &str) -> PlaneUsage {
-    let mut x_planes: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut y_planes: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut z_planes: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut total_objects = 0usize;
+/// A supported HEAT3 geometry box, normalized to a `Segment`. `label` is one
+/// of `p` (material), `s` (material by origin+extent), `b` (boundary), or `e`
+/// (empty).
+pub struct GeometryItem {
+    pub label: &'static str,
+    pub segment: Segment,
+}
 
-    for line in parse_script(script_text) {
-        let segment = match line.segment {
-            None => continue,
-            Some(s) => s,
-        };
-        total_objects += 1;
-        let [x1, y1, z1, x2, y2, z2] = segment.as_tuple();
-        x_planes.insert(normalize_plane(x1));
-        x_planes.insert(normalize_plane(x2));
-        y_planes.insert(normalize_plane(y1));
-        y_planes.insert(normalize_plane(y2));
-        z_planes.insert(normalize_plane(z1));
-        z_planes.insert(normalize_plane(z2));
+/// Collects every geometry box that Model Check understands, plus the distinct
+/// official geometric commands it does not (`c`, `h`). Plane counting, cavity
+/// occupancy and simplification gating all use this single definition.
+pub fn supported_geometry(script_text: &str) -> (Vec<GeometryItem>, Vec<String>) {
+    let mut items: Vec<GeometryItem> = Vec::new();
+    let mut unsupported: Vec<String> = Vec::new();
+    for (raw, _) in crate::text::split_lines(script_text) {
+        if let Some(label) = crate::parser::leading_command_label(&raw) {
+            match label {
+                's' => {
+                    if let Some(segment) = crate::parser::parse_s_box(&raw) {
+                        items.push(GeometryItem {
+                            label: "s",
+                            segment,
+                        });
+                    }
+                    continue;
+                }
+                'c' | 'h' => {
+                    let label = label.to_string();
+                    if !unsupported.contains(&label) {
+                        unsupported.push(label);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        let line = crate::parser::parse_line(&raw);
+        if let (Some(label), Some(segment)) = (line.label, line.segment) {
+            let static_label = match label.as_str() {
+                "p" => "p",
+                "b" => "b",
+                "e" => "e",
+                _ => continue,
+            };
+            items.push(GeometryItem {
+                label: static_label,
+                segment,
+            });
+        }
+    }
+    (items, unsupported)
+}
+
+pub fn count_model_planes(script_text: &str) -> PlaneUsage {
+    let mut x_planes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut y_planes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut z_planes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    let (items, _unsupported) = supported_geometry(script_text);
+    let total_objects = items.len();
+    for item in &items {
+        let [x1, y1, z1, x2, y2, z2] = item.segment.as_tuple();
+        x_planes.insert(plane_key(x1));
+        x_planes.insert(plane_key(x2));
+        y_planes.insert(plane_key(y1));
+        y_planes.insert(plane_key(y2));
+        z_planes.insert(plane_key(z1));
+        z_planes.insert(plane_key(z2));
     }
 
     PlaneUsage {
@@ -106,14 +166,17 @@ pub fn format_plane_usage(usage: &PlaneUsage) -> String {
     )
 }
 
-fn collect_positive_boxes(script_text: &str) -> Vec<Box3D> {
-    let mut boxes: Vec<Box3D> = Vec::new();
-    for line in parse_script(script_text) {
-        let segment = match line.segment {
-            None => continue,
-            Some(s) => s,
-        };
-        let [x1, y1, z1, x2, y2, z2] = segment.as_tuple();
+struct CavityGeometry {
+    plane_boxes: Vec<Box3D>,
+    occupancy_operations: Vec<(bool, Box3D)>,
+}
+
+fn collect_cavity_geometry(script_text: &str) -> CavityGeometry {
+    let mut plane_boxes = Vec::new();
+    let mut occupancy_operations = Vec::new();
+    let (items, _unsupported) = supported_geometry(script_text);
+    for item in items {
+        let [x1, y1, z1, x2, y2, z2] = item.segment.as_tuple();
         let min_x = x1.min(x2);
         let max_x = x1.max(x2);
         let min_y = y1.min(y2);
@@ -126,20 +189,32 @@ fn collect_positive_boxes(script_text: &str) -> Vec<Box3D> {
         {
             continue;
         }
-        boxes.push(Box3D {
+        let box_ = Box3D {
             x1: min_x,
             y1: min_y,
             z1: min_z,
             x2: max_x,
             y2: max_y,
             z2: max_z,
-        });
+        };
+        // HEAT3 applies overlapping objects in script order: a later material
+        // box fills cells, while an `e` box cuts them out. BC boxes contribute
+        // mesh planes, but are surfaces rather than material volume.
+        plane_boxes.push(box_);
+        match item.label {
+            "p" | "s" => occupancy_operations.push((true, box_)),
+            "e" => occupancy_operations.push((false, box_)),
+            _ => {}
+        }
     }
-    boxes
+    CavityGeometry {
+        plane_boxes,
+        occupancy_operations,
+    }
 }
 
 fn unique_sorted_coords(boxes: &[Box3D], axis: char) -> Vec<f64> {
-    let mut values_by_key: HashMap<String, f64> = HashMap::new();
+    let mut values_by_key: HashMap<u64, f64> = HashMap::new();
     for box_ in boxes {
         let (a, b) = match axis {
             'x' => (box_.x1, box_.x2),
@@ -147,11 +222,13 @@ fn unique_sorted_coords(boxes: &[Box3D], axis: char) -> Vec<f64> {
             'z' => (box_.z1, box_.z2),
             _ => (0.0, 0.0),
         };
-        values_by_key.insert(normalize_plane(a), a);
-        values_by_key.insert(normalize_plane(b), b);
+        let ca = canonical_plane(a);
+        let cb = canonical_plane(b);
+        values_by_key.insert(ca.to_bits(), ca);
+        values_by_key.insert(cb.to_bits(), cb);
     }
     let mut vals: Vec<f64> = values_by_key.into_values().collect();
-    vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    vals.sort_by(|a, b| a.total_cmp(b));
     vals
 }
 
@@ -193,8 +270,8 @@ fn neighbors(
 }
 
 pub fn detect_internal_cavities(script_text: &str, cell_limit: usize) -> CavityCheckResult {
-    let boxes = collect_positive_boxes(script_text);
-    if boxes.is_empty() {
+    let geometry = collect_cavity_geometry(script_text);
+    if geometry.plane_boxes.is_empty() || geometry.occupancy_operations.is_empty() {
         return CavityCheckResult {
             cavities: Vec::new(),
             skipped: false,
@@ -203,9 +280,9 @@ pub fn detect_internal_cavities(script_text: &str, cell_limit: usize) -> CavityC
         };
     }
 
-    let x_coords = unique_sorted_coords(&boxes, 'x');
-    let y_coords = unique_sorted_coords(&boxes, 'y');
-    let z_coords = unique_sorted_coords(&boxes, 'z');
+    let x_coords = unique_sorted_coords(&geometry.plane_boxes, 'x');
+    let y_coords = unique_sorted_coords(&geometry.plane_boxes, 'y');
+    let z_coords = unique_sorted_coords(&geometry.plane_boxes, 'z');
     let nx = (x_coords.len() as isize - 1).max(0) as usize;
     let ny = (y_coords.len() as isize - 1).max(0) as usize;
     let nz = (z_coords.len() as isize - 1).max(0) as usize;
@@ -228,35 +305,35 @@ pub fn detect_internal_cavities(script_text: &str, cell_limit: usize) -> CavityC
         };
     }
 
-    let x_index: HashMap<String, usize> = x_coords
+    let x_index: HashMap<u64, usize> = x_coords
         .iter()
         .enumerate()
-        .map(|(i, v)| (normalize_plane(*v), i))
+        .map(|(i, v)| (plane_key(*v), i))
         .collect();
-    let y_index: HashMap<String, usize> = y_coords
+    let y_index: HashMap<u64, usize> = y_coords
         .iter()
         .enumerate()
-        .map(|(i, v)| (normalize_plane(*v), i))
+        .map(|(i, v)| (plane_key(*v), i))
         .collect();
-    let z_index: HashMap<String, usize> = z_coords
+    let z_index: HashMap<u64, usize> = z_coords
         .iter()
         .enumerate()
-        .map(|(i, v)| (normalize_plane(*v), i))
+        .map(|(i, v)| (plane_key(*v), i))
         .collect();
     let mut occupied = vec![0u8; cell_count];
 
-    for box_ in &boxes {
-        let ix1 = x_index[&normalize_plane(box_.x1)];
-        let ix2 = x_index[&normalize_plane(box_.x2)];
-        let iy1 = y_index[&normalize_plane(box_.y1)];
-        let iy2 = y_index[&normalize_plane(box_.y2)];
-        let iz1 = z_index[&normalize_plane(box_.z1)];
-        let iz2 = z_index[&normalize_plane(box_.z2)];
+    for (is_material, box_) in &geometry.occupancy_operations {
+        let ix1 = x_index[&plane_key(box_.x1)];
+        let ix2 = x_index[&plane_key(box_.x2)];
+        let iy1 = y_index[&plane_key(box_.y1)];
+        let iy2 = y_index[&plane_key(box_.y2)];
+        let iz1 = z_index[&plane_key(box_.z1)];
+        let iz2 = z_index[&plane_key(box_.z2)];
         for ix in ix1..ix2 {
             for iy in iy1..iy2 {
                 let base = (ix * ny + iy) * nz;
                 for iz in iz1..iz2 {
-                    occupied[base + iz] = 1;
+                    occupied[base + iz] = u8::from(*is_material);
                 }
             }
         }
@@ -359,7 +436,7 @@ pub fn detect_internal_cavities(script_text: &str, cell_limit: usize) -> CavityC
 }
 
 fn format_coord(value: f64) -> String {
-    normalize_plane(value)
+    format_plane_display(value)
 }
 
 pub fn format_cavity_check(result: &CavityCheckResult) -> String {
@@ -512,6 +589,13 @@ pub struct SimplifyAnalysis {
     pub after_planes: Option<PlaneUsage>,
 }
 
+#[derive(Clone, Debug)]
+pub struct SimplifyProposalsResult {
+    pub script: String,
+    pub applied_count: usize,
+    pub rejected: Vec<MergeProposal>,
+}
+
 impl SimplifyAnalysis {
     pub fn total_saved(&self) -> i32 {
         match &self.after_planes {
@@ -592,8 +676,9 @@ fn collect_merge_proposals(
         if let Some(seg) = &line.segment {
             let (v1, v2) = axis_vals(seg, axis);
             for v in [v1, v2] {
-                if seen.insert(v.to_bits()) {
-                    sorted_coords.push(v);
+                let cv = canonical_plane(v);
+                if seen.insert(cv.to_bits()) {
+                    sorted_coords.push(cv);
                 }
             }
         }
@@ -690,18 +775,59 @@ pub fn simplify_planes(script_text: &str, tolerance: f64, max_change_percent: f6
     serialize_script(&lines, crate::config::LINE_BREAK)
 }
 
-pub fn simplify_proposals(script_text: &str, proposals: &[MergeProposal]) -> String {
+/// Replays displayed proposals in order, validating each against the model that
+/// the preceding selected proposals actually produced. A proposal may be unsafe
+/// when an earlier proposal it depended on was deselected.
+pub fn simplify_proposals(
+    script_text: &str,
+    proposals: &[MergeProposal],
+    tolerance: f64,
+    max_change_percent: f64,
+) -> SimplifyProposalsResult {
     let axis_index = [("X", 0), ("Y", 1), ("Z", 2)];
+    let tolerance_m = tolerance / 1000.0;
+    let max_change_ratio = max_change_percent / 100.0;
     let mut lines = parse_script(script_text);
+    let mut applied_count = 0;
+    let mut rejected = Vec::new();
     for prop in proposals {
-        let axis = axis_index
+        let Some(axis) = axis_index
             .iter()
             .find(|(name, _)| *name == prop.axis)
             .map(|(_, i)| *i)
-            .unwrap_or(0);
+        else {
+            rejected.push(prop.clone());
+            continue;
+        };
+        if prop.gap > tolerance_m + TOL
+            || !prop.coord_from.is_finite()
+            || !prop.coord_to.is_finite()
+        {
+            rejected.push(prop.clone());
+            continue;
+        }
+        let Some(revalidated) = build_proposal(
+            &lines,
+            axis,
+            prop.coord_from,
+            prop.coord_to,
+            max_change_ratio,
+        ) else {
+            rejected.push(prop.clone());
+            continue;
+        };
+        if revalidated.changes.is_empty() {
+            rejected.push(prop.clone());
+            continue;
+        }
         apply_merge(&mut lines, axis, prop.coord_from, prop.coord_to);
+        applied_count += 1;
     }
-    serialize_script(&lines, crate::config::LINE_BREAK)
+    SimplifyProposalsResult {
+        script: serialize_script(&lines, crate::config::LINE_BREAK),
+        applied_count,
+        rejected,
+    }
 }
 
 fn simplify_axis(lines: &mut [ScriptLine], axis: usize, tolerance: f64, max_change_ratio: f64) {
@@ -711,8 +837,9 @@ fn simplify_axis(lines: &mut [ScriptLine], axis: usize, tolerance: f64, max_chan
         if let Some(seg) = &line.segment {
             let (v1, v2) = axis_vals(seg, axis);
             for v in [v1, v2] {
-                if seen.insert(v.to_bits()) {
-                    unique.push(v);
+                let cv = canonical_plane(v);
+                if seen.insert(cv.to_bits()) {
+                    unique.push(cv);
                 }
             }
         }

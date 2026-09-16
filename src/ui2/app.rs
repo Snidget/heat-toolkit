@@ -1,7 +1,9 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use iced::widget::{checkbox, column, container, row, scrollable, stack, text};
-use iced::{Element, Length, Subscription, Theme};
+use iced::{Element, Length, Subscription, Task, Theme};
 
 use super::interactive_pages::{CheckPage, Turner2DPage, TurnerPage};
 use super::license::LicensePage;
@@ -54,6 +56,8 @@ pub enum Message {
     CloseSettings,
     SettingsTheme(AppTheme),
     SettingsGrid(bool),
+    SystemThemeTick,
+    ModalBackdrop,
     CanvasHover,
     ReportSelect(usize, usize, bool, bool),
     ReportPaste,
@@ -96,10 +100,13 @@ pub enum Message {
     AirCloseColor,
     AirHatch(u8),
     AirApply,
+    AirConfirmApply,
+    AirCancelApply,
     CheckPaste,
     CheckTolerance(String),
     CheckMaxChange(String),
     CheckTick,
+    CheckAnalysisCompleted(super::interactive_pages::CheckAnalysisResult),
     CheckProposalToggle(usize),
     CheckProposalCollapse(usize),
     CheckApplySelected,
@@ -143,6 +150,7 @@ pub struct App {
     script_text: String,
     script_text_2d: String,
     modifiers: iced::keyboard::Modifiers,
+    last_system_dark: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -190,23 +198,94 @@ impl Default for App {
             script_text: String::new(),
             script_text_2d: String::new(),
             modifiers: iced::keyboard::Modifiers::default(),
+            last_system_dark: None,
         }
     }
 }
 
-fn sync_script_fields(app: &mut App) {
+fn start_check_analysis(request: super::interactive_pages::CheckAnalysisRequest) -> Task<Message> {
+    Task::perform(
+        async move { super::interactive_pages::run_check_analysis(request) },
+        Message::CheckAnalysisCompleted,
+    )
+}
+
+fn sync_script_fields(app: &mut App) -> Task<Message> {
     app.turner.preview.show_grid = app.show_grid;
     app.turner_2d.preview.show_grid = app.show_grid;
     app.step_3d.sync_lines(&app.script_text);
     app.turner.sync(&app.script_text);
-    app.turner_2d.sync(&app.script_text);
     app.corner.sync_script(&app.script_text);
     app.report.sync_script(&app.script_text);
     app.material_sort.sync_script(&app.script_text);
-    app.check.sync_script(&app.script_text);
+    app.check
+        .sync_script(&app.script_text)
+        .map(start_check_analysis)
+        .unwrap_or_else(Task::none)
 }
 
-pub fn update(app: &mut App, message: Message) {
+fn replace_shared_script(app: &mut App, script: String) -> Task<Message> {
+    app.script_text = script;
+    sync_script_fields(app)
+}
+
+fn same_mtl_path(left: &Path, right: &Path) -> bool {
+    let normalized_left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let normalized_right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    normalized_left == normalized_right
+}
+
+fn reload_material_cache(
+    source_path: Option<&PathBuf>,
+    cache: &mut HashMap<String, crate::material_sort::MtlMaterial>,
+    mutated_path: &Path,
+) -> Result<bool, String> {
+    let Some(source_path) = source_path else {
+        return Ok(false);
+    };
+    if !same_mtl_path(source_path, mutated_path) {
+        return Ok(false);
+    }
+    let materials = crate::material_sort::parse_mtl_file(mutated_path, true)?;
+    *cache = crate::material_sort::materials_by_normalized_name_checked(&materials)?;
+    Ok(true)
+}
+
+fn message_allowed_while_unlicensed(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::Navigate(_)
+            | Message::About
+            | Message::CloseAbout
+            | Message::Settings
+            | Message::CloseSettings
+            | Message::SettingsTheme(_)
+            | Message::SettingsGrid(_)
+            | Message::ModalBackdrop
+            | Message::CanvasHover
+            | Message::ModifiersChanged(_)
+            | Message::LicenseKeyChanged(_)
+            | Message::LicenseToggleReveal
+            | Message::LicensePaste
+            | Message::LicenseActivate
+            | Message::LicenseRefresh
+            | Message::LicenseConfirmDeactivate
+            | Message::LicenseCancelDeactivate
+            | Message::LicenseDeactivate
+            | Message::LicensePoll
+            | Message::WindowOpened
+    )
+}
+
+pub fn update(app: &mut App, message: Message) -> Task<Message> {
+    let snapshot = app.license_manager.snapshot();
+    if !snapshot.dev_mode
+        && !snapshot.access.is_allowed()
+        && !message_allowed_while_unlicensed(&message)
+    {
+        return Task::none();
+    }
+    let mut task = Task::none();
     match message {
         Message::Navigate(page) => {
             app.page = page;
@@ -219,13 +298,33 @@ pub fn update(app: &mut App, message: Message) {
         Message::CloseSettings => app.show_settings = false,
         Message::SettingsTheme(theme_mode) => {
             app.theme_mode = theme_mode;
+            if theme_mode == AppTheme::System {
+                app.last_system_dark = Some(super::platform::windows_dark_mode());
+            } else {
+                app.last_system_dark = None;
+            }
             super::platform::apply_titlebar_theme(is_dark(app));
+            // Theme change affects canvas colors; invalidate preview caches.
+            app.turner.preview.cache.clear();
+            app.turner_2d.preview.cache.clear();
         }
         Message::SettingsGrid(show) => {
             app.show_grid = show;
             app.turner.preview.cache.clear();
             app.turner_2d.preview.cache.clear();
         }
+        Message::SystemThemeTick => {
+            if app.theme_mode == AppTheme::System {
+                let dark = super::platform::windows_dark_mode();
+                if app.last_system_dark != Some(dark) {
+                    app.last_system_dark = Some(dark);
+                    super::platform::apply_titlebar_theme(dark);
+                    app.turner.preview.cache.clear();
+                    app.turner_2d.preview.cache.clear();
+                }
+            }
+        }
+        Message::ModalBackdrop => {}
         Message::CanvasHover => {}
         Message::ReportSelect(row, column, shift, command) => {
             app.report.select_cell((row, column), shift, command)
@@ -238,10 +337,7 @@ pub fn update(app: &mut App, message: Message) {
                 ));
             }
             Ok(text) => {
-                app.script_text = text;
-                app.report.sync_script(&app.script_text);
-                app.step_3d.sync_lines(&app.script_text);
-                app.turner.sync(&app.script_text);
+                task = replace_shared_script(app, text);
                 app.report.selected_cells.clear();
                 app.report.selection_anchor = None;
                 app.report.status = Some(("Скрипт вставлен из буфера обмена.".to_owned(), false));
@@ -256,11 +352,13 @@ pub fn update(app: &mut App, message: Message) {
                 .add_filter("Material files", &["mtl", "MTL"])
                 .pick_file()
             {
-                match crate::material_sort::parse_mtl_file(&path, false) {
-                    Ok(materials) => {
-                        let count = materials.len();
-                        app.report.mtl_materials =
-                            crate::material_sort::materials_by_normalized_name(&materials);
+                match crate::material_sort::parse_mtl_file(&path, true).and_then(|materials| {
+                    crate::material_sort::materials_by_normalized_name_checked(&materials)
+                        .map(|map| (map, materials.len()))
+                }) {
+                    Ok((map, count)) => {
+                        app.report.mtl_materials = map;
+                        app.report.mtl_path = Some(path.clone());
                         app.report.refresh_items();
                         let colors = app.report.material_color_map();
                         app.step_3d.set_material_colors(colors.clone());
@@ -284,11 +382,11 @@ pub fn update(app: &mut App, message: Message) {
             }
         }
         Message::ModifiersChanged(modifiers) => app.modifiers = modifiers,
-        Message::LicenseKeyChanged(value) => app.license.key = value,
+        Message::LicenseKeyChanged(value) => app.license.set_key(value),
         Message::LicenseToggleReveal => app.license.reveal_key = !app.license.reveal_key,
         Message::LicensePaste => {
             if let Ok(value) = crate::clipboard::read_text() {
-                app.license.key = value.trim().to_owned();
+                app.license.set_key(value.trim().to_owned());
             }
         }
         Message::LicenseActivate => {
@@ -313,7 +411,7 @@ pub fn update(app: &mut App, message: Message) {
             }
             Ok(text) => {
                 app.script_text = text;
-                sync_script_fields(app);
+                task = sync_script_fields(app);
                 app.material_sort.status =
                     Some(("Скрипт вставлен из буфера обмена.".to_owned(), false));
             }
@@ -327,23 +425,18 @@ pub fn update(app: &mut App, message: Message) {
                 .add_filter("Material files", &["mtl", "MTL"])
                 .pick_file()
             {
-                match crate::material_sort::parse_mtl_file(&path, false) {
-                    Ok(materials) => {
-                        let mut map = std::collections::HashMap::new();
-                        for material in &materials {
-                            map.insert(
-                                crate::material_sort::normalize_material_name(&material.name),
-                                material.clone(),
-                            );
-                        }
+                match crate::material_sort::parse_mtl_file(&path, true).and_then(|materials| {
+                    crate::material_sort::materials_by_normalized_name_checked(&materials)
+                        .map(|map| (map, materials.len()))
+                }) {
+                    Ok((map, count)) => {
                         app.material_sort.mtl_materials = map;
+                        app.material_sort.mtl_path = Some(path.clone());
                         let colors = app.material_sort.color_map();
                         app.step_3d.set_material_colors(colors.clone());
                         app.corner.set_material_colors(colors);
-                        app.material_sort.status = Some((
-                            format!("Материалов загружено из MTL: {}.", materials.len()),
-                            false,
-                        ));
+                        app.material_sort.status =
+                            Some((format!("Материалов загружено из MTL: {count}."), false));
                     }
                     Err(error) => {
                         app.material_sort.status = Some((format!("Ошибка MTL: {error}"), true));
@@ -357,13 +450,24 @@ pub fn update(app: &mut App, message: Message) {
                 &mut app.material_sort.names,
                 &app.material_sort.mtl_materials,
             );
-            app.script_text =
+            let new_script =
                 super::static_pages::reorder_script(&app.script_text, &app.material_sort.names);
-            sync_script_fields(app);
-            app.material_sort.status = Some((
-                "Материалы отсортированы по теплопроводности.".to_owned(),
-                false,
-            ));
+            if new_script != app.script_text
+                && !crate::material_sort::is_material_reorder_safe(&app.script_text)
+            {
+                app.material_sort.status = Some((
+                    "Сортировка заблокирована: перекрывающиеся боксы — изменение порядка изменит геометрию. Порядок оставлен без изменений."
+                        .to_owned(),
+                    true,
+                ));
+            } else {
+                app.script_text = new_script;
+                task = sync_script_fields(app);
+                app.material_sort.status = Some((
+                    "Материалы отсортированы по теплопроводности.".to_owned(),
+                    false,
+                ));
+            }
         }
         Message::MaterialCopy => {
             if app.script_text.is_empty() {
@@ -383,10 +487,24 @@ pub fn update(app: &mut App, message: Message) {
         }
         Message::MaterialMove(index, delta) => {
             app.material_sort.move_item(index, delta);
-            app.script_text =
+            let new_script =
                 super::static_pages::reorder_script(&app.script_text, &app.material_sort.names);
-            sync_script_fields(app);
-            app.material_sort.status = Some(("Порядок материалов изменён.".to_owned(), false));
+            if new_script != app.script_text
+                && !crate::material_sort::is_material_reorder_safe(&app.script_text)
+            {
+                // revert move
+                app.material_sort
+                    .move_item((index as isize + delta) as usize, -delta);
+                app.material_sort.status = Some((
+                    "Перемещение заблокировано: перекрывающиеся боксы — изменение порядка изменит геометрию."
+                        .to_owned(),
+                    true,
+                ));
+            } else {
+                app.script_text = new_script;
+                task = sync_script_fields(app);
+                app.material_sort.status = Some(("Порядок материалов изменён.".to_owned(), false));
+            }
         }
         Message::CornerPaste => match crate::clipboard::read_text() {
             Ok(text) if text.trim().is_empty() => {
@@ -396,7 +514,7 @@ pub fn update(app: &mut App, message: Message) {
                 app.corner.result = None;
                 app.corner.result_lines.clear();
                 app.script_text = text;
-                sync_script_fields(app);
+                task = sync_script_fields(app);
                 app.corner.status = Some(("Скрипт вставлен из буфера обмена.".to_owned(), false));
             }
             Err(error) => {
@@ -412,7 +530,7 @@ pub fn update(app: &mut App, message: Message) {
                 app.corner.result = Some(result.clone());
                 app.corner.result_lines = crate::parser::parse_script(&result);
                 app.script_text = result;
-                sync_script_fields(app);
+                task = sync_script_fields(app);
             }
         }
         Message::CornerView(view) => {
@@ -441,27 +559,47 @@ pub fn update(app: &mut App, message: Message) {
             }
         }
         Message::CornerDirection(delta) => {
-            app.corner.direction = ((app.corner.direction as isize + delta).rem_euclid(4)) as usize;
+            let new_direction = ((app.corner.direction as isize + delta).rem_euclid(4)) as usize;
+            if new_direction != app.corner.direction {
+                app.corner.direction = new_direction;
+                app.corner.clear_result();
+            }
         }
         Message::AirApply => {
-            if let Some(path) = app.air_cavities.mtl_path.clone() {
-                match super::static_pages::apply_air_cavity_upsert(
+            if app.air_cavities.mtl_path.is_none() {
+                app.air_cavities.status = Some(("Файл MTL не выбран.".to_owned(), true));
+            } else if let Some(path) = app.air_cavities.mtl_path.clone() {
+                match crate::air_cavities::preflight_air_cavity_upsert(
                     path.as_path(),
-                    &app.air_cavities,
+                    &app.air_cavities.specs,
                 ) {
-                    Ok(result) => {
-                        let status = format!(
-                            "Готово. Обновлено: {}, добавлено: {}",
-                            result.updated_count(),
-                            result.added_count()
-                        );
-                        app.air_cavities.status = Some((status, false));
+                    Ok(preflight) if preflight.has_replacements() => {
+                        app.air_cavities.pending_replacements = Some(preflight.replaced.clone());
+                        app.air_cavities.status = Some((
+                            format!(
+                                "Внимание: будут перезаписаны существующие материалы: {}.",
+                                preflight.replaced.join(", ")
+                            ),
+                            true,
+                        ));
+                    }
+                    Ok(_) => {
+                        app.air_cavities.pending_replacements = None;
+                        apply_air_cavity_upsert(app);
                     }
                     Err(error) => {
                         app.air_cavities.status = Some((format!("Ошибка: {error}"), true));
                     }
                 }
             }
+        }
+        Message::AirCancelApply => {
+            app.air_cavities.pending_replacements = None;
+            app.air_cavities.status = Some(("Запись отменена.".to_owned(), false));
+        }
+        Message::AirConfirmApply => {
+            app.air_cavities.pending_replacements = None;
+            apply_air_cavity_upsert(app);
         }
         Message::AirOpen => {
             if let Some(path) = rfd::FileDialog::new()
@@ -525,16 +663,12 @@ pub fn update(app: &mut App, message: Message) {
         }
         Message::CheckPaste => match crate::clipboard::read_text() {
             Ok(text) if text.trim().is_empty() => {
-                app.check.analysis = None;
-                app.check.proposals.clear();
-                app.check.simplified = None;
-                app.check.cavity = None;
-                app.check.cached_script.clear();
+                app.check.clear();
                 app.check.status = Some(("Буфер обмена пуст.".to_owned(), true));
             }
             Ok(text) => {
                 app.script_text = text;
-                sync_script_fields(app);
+                task = sync_script_fields(app);
                 app.check.status = Some(("Скрипт вставлен из буфера обмена.".to_owned(), false));
             }
             Err(error) => {
@@ -543,23 +677,48 @@ pub fn update(app: &mut App, message: Message) {
             }
         },
         Message::CheckTolerance(value) => {
-            app.check.tolerance = value;
-            if let Ok(t) = app.check.tolerance.trim().parse::<f64>() {
-                let clamped = t.clamp(0.1, 100.0);
-                app.check.tolerance = format!("{clamped:.1}");
+            app.check.tolerance = value.clone();
+            match value.trim().parse::<f64>() {
+                Ok(v) if v.is_finite() => {
+                    let clamped = v.clamp(0.1, 100.0);
+                    app.check.tolerance = format!("{clamped:.1}");
+                    app.check.status = None;
+                    app.check.mark_pending();
+                }
+                _ => {
+                    app.check.invalidate_for_invalid_input();
+                    app.check.status = Some((
+                        "Толерантность: введите конечное число 0.1…100".to_owned(),
+                        true,
+                    ));
+                }
             }
-            app.check.mark_pending();
         }
         Message::CheckMaxChange(value) => {
-            app.check.max_change = value;
-            if let Ok(m) = app.check.max_change.trim().parse::<f64>() {
-                let clamped = m.clamp(0.1, 50.0);
-                app.check.max_change = format!("{clamped:.1}");
+            app.check.max_change = value.clone();
+            match value.trim().parse::<f64>() {
+                Ok(v) if v.is_finite() => {
+                    let clamped = v.clamp(0.1, 50.0);
+                    app.check.max_change = format!("{clamped:.1}");
+                    app.check.status = None;
+                    app.check.mark_pending();
+                }
+                _ => {
+                    app.check.invalidate_for_invalid_input();
+                    app.check.status = Some((
+                        "Макс. изменение: введите конечное число 0.1…50".to_owned(),
+                        true,
+                    ));
+                }
             }
-            app.check.mark_pending();
         }
         Message::CheckTick => {
-            app.check.tick();
+            if let Some(request) = app.check.tick() {
+                task = start_check_analysis(request);
+            }
+        }
+        Message::CheckAnalysisCompleted(result) => {
+            app.check.apply_analysis(result);
         }
         Message::CheckProposalToggle(index) => {
             if let Some(value) = app.check.checked.get_mut(index) {
@@ -584,19 +743,54 @@ pub fn update(app: &mut App, message: Message) {
                 if selected.is_empty() {
                     app.check.status = Some(("Не выбрано ни одного упрощения.".to_owned(), true));
                 } else {
-                    app.check.simplified = Some(crate::model_check::simplify_proposals(
+                    let result = crate::model_check::simplify_proposals(
                         &app.script_text,
                         &selected,
-                    ));
+                        app.check.tolerance.trim().parse().unwrap_or_default(),
+                        app.check.max_change.trim().parse().unwrap_or_default(),
+                    );
+                    if result.rejected.is_empty() {
+                        app.check.status = Some((
+                            format!("Применено упрощений: {}.", result.applied_count),
+                            false,
+                        ));
+                    } else {
+                        let rejected = result
+                            .rejected
+                            .iter()
+                            .map(|proposal| {
+                                format!(
+                                    "{} {} → {}",
+                                    proposal.axis, proposal.coord_from, proposal.coord_to
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        app.check.status = Some((
+                            format!(
+                                "Применено: {}. Пропущено как небезопасные: {rejected}.",
+                                result.applied_count
+                            ),
+                            true,
+                        ));
+                    }
+                    app.check.simplified = Some(result.script);
                 }
             }
         }
         Message::CheckSimplifyAll => {
             if !app.script_text.trim().is_empty() && !app.check.proposals.is_empty() {
-                app.check.simplified = Some(crate::model_check::simplify_proposals(
+                let result = crate::model_check::simplify_proposals(
                     &app.script_text,
                     &app.check.proposals,
+                    app.check.tolerance.trim().parse().unwrap_or_default(),
+                    app.check.max_change.trim().parse().unwrap_or_default(),
+                );
+                app.check.status = Some((
+                    format!("Применено упрощений: {}.", result.applied_count),
+                    !result.rejected.is_empty(),
                 ));
+                app.check.simplified = Some(result.script);
             }
         }
         Message::CheckCopy => {
@@ -616,7 +810,7 @@ pub fn update(app: &mut App, message: Message) {
             }
             Ok(text) => {
                 app.script_text = text;
-                sync_script_fields(app);
+                task = sync_script_fields(app);
                 app.turner.status = Some(("Скрипт вставлен из буфера обмена.".to_owned(), false));
             }
             Err(error) => {
@@ -641,23 +835,35 @@ pub fn update(app: &mut App, message: Message) {
             }
         }
         Message::TurnerProjection(projection) => {
+            app.turner.preview.set_projection(projection);
             app.turner.projection = projection;
-            app.turner.preview.projection = projection;
         }
         Message::TurnerTransform(name) => {
             if app.script_text.is_empty() {
                 app.turner.status = Some(("Нет данных для преобразования.".to_owned(), true));
-            } else if let Some(result) =
-                super::interactive_pages::transform_script(&app.script_text, name)
-            {
-                app.script_text = result;
-                sync_script_fields(app);
-                app.turner.status = Some(("Преобразование выполнено.".to_owned(), false));
             } else {
-                app.turner.status = Some((
-                    "В скрипте не найдены геометрические элементы.".to_owned(),
-                    true,
-                ));
+                let unsupported =
+                    crate::transforms::unsupported_geometry_commands(&app.script_text);
+                if !unsupported.is_empty() {
+                    app.turner.status = Some((
+                        format!(
+                            "Преобразование отменено: скрипт содержит неподдерживаемые геометрические команды ({}). Такие команды остались бы в старых координатах.",
+                            unsupported.join(", ")
+                        ),
+                        true,
+                    ));
+                } else if let Some(result) =
+                    super::interactive_pages::transform_script(&app.script_text, name)
+                {
+                    app.script_text = result;
+                    task = sync_script_fields(app);
+                    app.turner.status = Some(("Преобразование выполнено.".to_owned(), false));
+                } else {
+                    app.turner.status = Some((
+                        "В скрипте не найдены геометрические элементы.".to_owned(),
+                        true,
+                    ));
+                }
             }
         }
         Message::TurnerInstruction => app.turner.show_instruction = !app.turner.show_instruction,
@@ -698,15 +904,27 @@ pub fn update(app: &mut App, message: Message) {
         Message::Turner2DTransform(name) => {
             if app.script_text_2d.is_empty() {
                 app.turner_2d.status = Some(("Нет данных для преобразования.".to_owned(), true));
-            } else if let Some(result) =
-                super::interactive_pages::transform_2d(&app.script_text_2d, name)
-            {
-                app.script_text_2d = result;
-                app.turner_2d.sync(&app.script_text_2d);
-                app.turner_2d.status = Some(("Преобразование выполнено.".to_owned(), false));
             } else {
-                app.turner_2d.status =
-                    Some(("Не удалось выполнить преобразование.".to_owned(), true));
+                let unsupported =
+                    crate::turner2d::unsupported_geometry_commands(&app.script_text_2d);
+                if !unsupported.is_empty() {
+                    app.turner_2d.status = Some((
+                        format!(
+                            "Преобразование отменено: 2D-скрипт содержит неподдерживаемые пространственные команды ({}). Они остались бы в старых координатах.",
+                            unsupported.join(", ")
+                        ),
+                        true,
+                    ));
+                } else if let Some(result) =
+                    super::interactive_pages::transform_2d(&app.script_text_2d, name)
+                {
+                    app.script_text_2d = result;
+                    app.turner_2d.sync(&app.script_text_2d);
+                    app.turner_2d.status = Some(("Преобразование выполнено.".to_owned(), false));
+                } else {
+                    app.turner_2d.status =
+                        Some(("Не удалось выполнить преобразование.".to_owned(), true));
+                }
             }
         }
         Message::StepPaste => match crate::clipboard::read_text() {
@@ -715,7 +933,7 @@ pub fn update(app: &mut App, message: Message) {
             }
             Ok(text) => {
                 app.script_text = text;
-                sync_script_fields(app);
+                task = sync_script_fields(app);
                 app.step_3d.status = Some(("Скрипт вставлен из буфера обмена.".to_owned(), false));
             }
             Err(error) => {
@@ -744,6 +962,87 @@ pub fn update(app: &mut App, message: Message) {
             app.step_3d.active_view = None;
         }
         Message::WindowOpened => super::platform::apply_titlebar_theme(is_dark(app)),
+    }
+    task
+}
+
+/// Writes the generated Air Cavities materials into the selected MTL and
+/// refreshes every derived cache. Callers must have already confirmed any
+/// intentional overwrite of existing materials.
+fn apply_air_cavity_upsert(app: &mut App) {
+    let Some(path) = app.air_cavities.mtl_path.clone() else {
+        app.air_cavities.status = Some(("Файл MTL не выбран.".to_owned(), true));
+        return;
+    };
+    match super::static_pages::apply_air_cavity_upsert(path.as_path(), &app.air_cavities) {
+        Ok(result) => {
+            let report_reload = reload_material_cache(
+                app.report.mtl_path.as_ref(),
+                &mut app.report.mtl_materials,
+                path.as_path(),
+            );
+            let material_reload = reload_material_cache(
+                app.material_sort.mtl_path.as_ref(),
+                &mut app.material_sort.mtl_materials,
+                path.as_path(),
+            );
+            let mut reload_errors = Vec::new();
+            let mut refreshed_colors = None;
+            match report_reload {
+                Ok(true) => {
+                    app.report.refresh_items();
+                    refreshed_colors = Some(app.report.material_color_map());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    app.report.mtl_materials.clear();
+                    app.report.refresh_items();
+                    app.report.status =
+                        Some((format!("MTL требуется открыть повторно: {error}"), true));
+                    reload_errors.push("шкала".to_owned());
+                }
+            }
+            match material_reload {
+                Ok(true) => {
+                    refreshed_colors.get_or_insert_with(|| app.material_sort.color_map());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    app.material_sort.mtl_materials.clear();
+                    app.material_sort.status =
+                        Some((format!("MTL требуется открыть повторно: {error}"), true));
+                    reload_errors.push("сортировка".to_owned());
+                }
+            }
+            if reload_errors.is_empty() {
+                if let Some(colors) = refreshed_colors {
+                    app.step_3d.set_material_colors(colors.clone());
+                    app.corner.set_material_colors(colors);
+                }
+            } else {
+                app.step_3d.set_material_colors(HashMap::new());
+                app.corner.set_material_colors(HashMap::new());
+            }
+            let status = format!(
+                "Готово. Обновлено: {}, добавлено: {}",
+                result.updated_count(),
+                result.added_count()
+            );
+            app.air_cavities.status = Some((
+                if reload_errors.is_empty() {
+                    status
+                } else {
+                    format!(
+                        "{status}. Не удалось обновить: {}.",
+                        reload_errors.join(", ")
+                    )
+                },
+                !reload_errors.is_empty(),
+            ));
+        }
+        Err(error) => {
+            app.air_cavities.status = Some((format!("Ошибка: {error}"), true));
+        }
     }
 }
 
@@ -1003,28 +1302,18 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         Subscription::<Message>::none()
     } else if app.license_manager.snapshot().operation != LicenseOperation::Idle {
         // Active activation/deactivation — poll fast to catch worker completion.
-        Subscription::run(|| {
-            iced::futures::stream::unfold((), |state| async move {
-                std::thread::sleep(Duration::from_millis(80));
-                Some((Message::LicensePoll, state))
-            })
-        })
+        iced::time::every(Duration::from_millis(80)).map(|_| Message::LicensePoll)
     } else {
         // Idle: slow heartbeat only for online-refresh due checks.
-        Subscription::run(|| {
-            iced::futures::stream::unfold((), |state| async move {
-                std::thread::sleep(Duration::from_secs(30));
-                Some((Message::LicensePoll, state))
-            })
-        })
+        iced::time::every(Duration::from_secs(30)).map(|_| Message::LicensePoll)
     };
     let check_tick = if app.check.is_pending() {
-        Subscription::run(|| {
-            iced::futures::stream::unfold((), |state| async move {
-                std::thread::sleep(Duration::from_millis(100));
-                Some((Message::CheckTick, state))
-            })
-        })
+        iced::time::every(Duration::from_millis(100)).map(|_| Message::CheckTick)
+    } else {
+        Subscription::<Message>::none()
+    };
+    let system_theme_poll = if app.theme_mode == AppTheme::System {
+        iced::time::every(Duration::from_secs(1)).map(|_| Message::SystemThemeTick)
     } else {
         Subscription::<Message>::none()
     };
@@ -1039,5 +1328,68 @@ pub fn subscription(app: &App) -> Subscription<Message> {
         }) if modifiers.command() => Some(Message::ReportCopyShortcut),
         _ => None,
     });
-    Subscription::batch([window_events, license_poll, check_tick, keyboard_events])
+    Subscription::batch([
+        window_events,
+        license_poll,
+        check_tick,
+        system_theme_poll,
+        keyboard_events,
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_script_sync_preserves_the_independent_2d_preview() {
+        let mut app = App {
+            script_text_2d: "r 0 0 2 3 cavity".to_owned(),
+            ..Default::default()
+        };
+        app.turner_2d.sync(&app.script_text_2d);
+        let expected_rectangles = app.turner_2d.preview.rects.len();
+
+        let _ = replace_shared_script(&mut app, "p 0 0 0 1 1 1 material".to_owned());
+
+        assert_eq!(app.turner_2d.preview.rects.len(), expected_rectangles);
+        assert_eq!(app.check.cached_script, app.script_text);
+    }
+
+    #[test]
+    fn reload_material_cache_updates_only_the_mutated_source_file() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("heat3-cache-{unique}.mtl"));
+        let other_path = std::env::temp_dir().join(format!("heat3-cache-other-{unique}.mtl"));
+        let old = crate::material_sort::MtlMaterial {
+            name: "Air".to_owned(),
+            thermal_x: 0.1,
+            thermal_y: 0.1,
+            volume_heat: 0.0,
+            rgb_r: 1,
+            rgb_g: 2,
+            rgb_b: 3,
+            special_value: 0,
+        };
+        let mut updated = old.clone();
+        updated.thermal_x = 0.2;
+        crate::material_sort::write_mtl_file(&path, std::slice::from_ref(&old)).unwrap();
+        crate::material_sort::write_mtl_file(&other_path, &[old]).unwrap();
+
+        let source = Some(path.clone());
+        let mut cache = HashMap::new();
+        cache.insert("air".to_owned(), updated.clone());
+        crate::material_sort::write_mtl_file(&path, &[updated]).unwrap();
+
+        assert!(reload_material_cache(source.as_ref(), &mut cache, &path).unwrap());
+        assert_eq!(cache["air"].thermal_x, 0.2);
+        assert!(!reload_material_cache(source.as_ref(), &mut cache, &other_path).unwrap());
+        assert_eq!(cache["air"].thermal_x, 0.2);
+
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(other_path).ok();
+    }
 }

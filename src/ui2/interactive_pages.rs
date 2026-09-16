@@ -27,6 +27,34 @@ const TURNER_MIRROR_XZ_X_LABEL: &str = "Отражение XZ по X";
 const TURNER_MIRROR_XZ_Z_LABEL: &str = "Отражение XZ по Z";
 const TURNER_COPY_LABEL: &str = "Копировать данные в буфер обмена";
 
+#[derive(Clone, Debug)]
+pub struct CheckAnalysisRequest {
+    generation: u64,
+    script: String,
+    tolerance: f64,
+    max_change: f64,
+    include_cavity: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct CheckAnalysisResult {
+    generation: u64,
+    cavity: Option<CavityCheckResult>,
+    analysis: SimplifyAnalysis,
+}
+
+pub fn run_check_analysis(request: CheckAnalysisRequest) -> CheckAnalysisResult {
+    let cavity = request
+        .include_cavity
+        .then(|| detect_internal_cavities(&request.script, crate::model_check::CAVITY_CELL_LIMIT));
+    let analysis = analyze_simplify(&request.script, request.tolerance, request.max_change);
+    CheckAnalysisResult {
+        generation: request.generation,
+        cavity,
+        analysis,
+    }
+}
+
 pub struct CheckPage {
     pub tolerance: String,
     pub max_change: String,
@@ -39,7 +67,12 @@ pub struct CheckPage {
     pub collapsed: Vec<bool>,
     pub simplified: Option<String>,
     pub cached_script: String,
+    /// Official geometric commands (e.g. `c`, `h`) that Check does not model.
+    pub unsupported: Vec<String>,
+    /// True when simplification would silently ignore real geometry (`s`/`c`/`h`).
+    pub simplification_blocked: bool,
     analysis_pending_since: Option<Instant>,
+    generation: u64,
 }
 
 impl Default for CheckPage {
@@ -56,74 +89,138 @@ impl Default for CheckPage {
             collapsed: Vec::new(),
             simplified: None,
             cached_script: String::new(),
+            unsupported: Vec::new(),
+            simplification_blocked: false,
             analysis_pending_since: None,
+            generation: 0,
         }
     }
 }
 
 impl CheckPage {
-    pub fn sync_script(&mut self, script: &str) {
+    pub fn sync_script(&mut self, script: &str) -> Option<CheckAnalysisRequest> {
         if self.cached_script == script {
-            return;
+            return None;
         }
+        self.generation = self.generation.wrapping_add(1);
         self.cached_script = script.to_owned();
         self.usage = Some(count_model_planes(script));
+        self.analysis = None;
+        self.cavity = None;
+        self.proposals.clear();
+        self.checked.clear();
+        self.collapsed.clear();
+        self.simplified = None;
+        let (items, unsupported) = crate::model_check::supported_geometry(script);
+        let has_s = items.iter().any(|item| item.label == "s");
+        self.unsupported = unsupported;
+        // `s` boxes are counted and contribute cavity occupancy, but the
+        // simplifier cannot rewrite them, so any simplification would be
+        // partial while ignoring real material geometry.
+        self.simplification_blocked = !self.unsupported.is_empty() || has_s;
         if script.trim().is_empty() {
-            self.analysis = None;
-            self.cavity = None;
-            self.proposals.clear();
-            self.checked.clear();
-            self.collapsed.clear();
-            self.simplified = None;
             self.analysis_pending_since = None;
-            return;
+            return None;
         }
-        self.cavity = Some(detect_internal_cavities(
-            script,
-            crate::model_check::CAVITY_CELL_LIMIT,
-        ));
         self.analysis_pending_since = None;
-        self.reanalyze(script);
+        self.analysis_request(true)
+    }
+
+    pub fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.cached_script.clear();
+        self.usage = None;
+        self.analysis = None;
+        self.cavity = None;
+        self.proposals.clear();
+        self.checked.clear();
+        self.collapsed.clear();
+        self.simplified = None;
+        self.unsupported.clear();
+        self.simplification_blocked = false;
+        self.analysis_pending_since = None;
     }
 
     pub fn mark_pending(&mut self) {
         if !self.cached_script.trim().is_empty() {
+            self.generation = self.generation.wrapping_add(1);
+            self.analysis = None;
+            self.proposals.clear();
+            self.checked.clear();
+            self.collapsed.clear();
+            self.simplified = None;
             self.analysis_pending_since = Some(Instant::now());
         }
+    }
+
+    pub fn invalidate_for_invalid_input(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.analysis = None;
+        self.proposals.clear();
+        self.checked.clear();
+        self.collapsed.clear();
+        self.simplified = None;
+        self.analysis_pending_since = None;
     }
 
     pub fn is_pending(&self) -> bool {
         self.analysis_pending_since.is_some()
     }
 
-    pub fn tick(&mut self) {
+    pub fn tick(&mut self) -> Option<CheckAnalysisRequest> {
         if let Some(started) = self.analysis_pending_since {
             if started.elapsed() >= Duration::from_millis(DEBOUNCE_MS) {
-                let script = self.cached_script.clone();
-                self.reanalyze(&script);
                 self.analysis_pending_since = None;
+                return self.analysis_request(false);
             }
         }
+        None
     }
 
-    pub fn reanalyze(&mut self, script: &str) {
-        if script.trim().is_empty() {
-            return;
-        }
-        let (Ok(tolerance), Ok(max_change)) = (
-            self.tolerance.trim().parse::<f64>(),
-            self.max_change.trim().parse::<f64>(),
-        ) else {
-            return;
+    fn analysis_request(&self, include_cavity: bool) -> Option<CheckAnalysisRequest> {
+        let Ok(tolerance) = self.tolerance.trim().parse::<f64>() else {
+            return None;
         };
-        self.analysis = Some(analyze_simplify(script, tolerance, max_change));
-        self.proposals = self
-            .analysis
-            .as_ref()
-            .map(|analysis| analysis.proposals.clone())
-            .unwrap_or_default();
+        let Ok(max_change) = self.max_change.trim().parse::<f64>() else {
+            return None;
+        };
+        if !tolerance.is_finite() || !max_change.is_finite() {
+            return None;
+        }
+        if !(0.1..=100.0).contains(&tolerance) || !(0.1..=50.0).contains(&max_change) {
+            return None;
+        }
+        Some(CheckAnalysisRequest {
+            generation: self.generation,
+            script: self.cached_script.clone(),
+            tolerance,
+            max_change,
+            include_cavity,
+        })
+    }
+
+    pub fn apply_analysis(&mut self, result: CheckAnalysisResult) -> bool {
+        if result.generation != self.generation {
+            return false;
+        }
+        if let Some(cavity) = result.cavity {
+            self.cavity = Some(cavity);
+        }
+        self.analysis = Some(result.analysis);
+        if self.simplification_blocked {
+            // Do not offer proposals that were computed while real geometry was
+            // ignored by the simplifier.
+            self.proposals.clear();
+        } else {
+            self.proposals = self
+                .analysis
+                .as_ref()
+                .map(|analysis| analysis.proposals.clone())
+                .unwrap_or_default();
+        }
         self.checked = vec![true; self.proposals.len()];
         self.collapsed = vec![false; self.proposals.len()];
+        true
     }
 
     fn colored(content: String, status: theme::Status) -> Element<'static, Message> {
@@ -154,6 +251,16 @@ impl CheckPage {
             Message::CheckPaste,
         ));
 
+        if !self.unsupported.is_empty() {
+            content = content.push(Self::colored(
+                format!(
+                    "Анализ неполный: скрипт содержит геометрические команды, которые Проверка не моделирует: {}. Результаты ниже могут быть неполными.",
+                    self.unsupported.join(", ")
+                ),
+                theme::Status::Error,
+            ));
+        }
+
         content = content.push(section_title("Использование плоскостей"));
         let usage = self
             .usage
@@ -172,12 +279,22 @@ impl CheckPage {
             Some(cavity) => {
                 let status = if cavity.cavities_found() {
                     theme::Status::Error
-                } else if cavity.skipped {
+                } else if cavity.skipped || !self.unsupported.is_empty() {
                     theme::Status::Warn
                 } else {
                     theme::Status::Ok
                 };
-                content = content.push(Self::colored(format_cavity_check(cavity), status));
+                if !cavity.cavities_found() && !self.unsupported.is_empty() {
+                    content = content.push(Self::colored(
+                        format!(
+                            "{} Результат неполный из-за неподдерживаемых команд.",
+                            format_cavity_check(cavity)
+                        ),
+                        status,
+                    ));
+                } else {
+                    content = content.push(Self::colored(format_cavity_check(cavity), status));
+                }
             }
             None => {
                 content = content.push(
@@ -187,6 +304,13 @@ impl CheckPage {
         }
 
         content = content.push(section_title("Упрощение модели"));
+        if self.simplification_blocked && !self.cached_script.trim().is_empty() {
+            content = content.push(Self::colored(
+                "Упрощение недоступно: модель содержит material-боксы формата `s` или неподдерживаемые команды, которые упроститель не изменяет."
+                    .to_owned(),
+                theme::Status::Warn,
+            ));
+        }
         content = content.push(
             row![
                 text("Порог схождения (мм):").size(theme::BODY_SIZE),
@@ -401,7 +525,7 @@ impl TurnerPage {
                 .width(Length::Fill)
                 .align_x(iced::Alignment::Center)
                 .into();
-        let element_count = self.preview.rects.len();
+        let element_count = self.preview.segment_count();
         let content = column![
             preview,
             hero_metric(
@@ -712,10 +836,7 @@ fn rotation_button<'a>(label: &'a str, message: Message) -> Element<'a, Message>
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        TURNER_COPY_LABEL, TURNER_MIRROR_XY_X_LABEL, TURNER_MIRROR_XY_Y_LABEL,
-        TURNER_MIRROR_XZ_X_LABEL, TURNER_MIRROR_XZ_Z_LABEL, TURNER_PASTE_LABEL,
-    };
+    use super::*;
 
     #[test]
     fn turner_button_labels_preserve_user_facing_contract() {
@@ -737,5 +858,20 @@ mod tests {
                 "Копировать данные в буфер обмена",
             ]
         );
+    }
+
+    #[test]
+    fn stale_analysis_result_cannot_replace_newer_script_state() {
+        let mut page = CheckPage::default();
+        let request = page
+            .sync_script("p 0 0 0 1 1 1 material")
+            .expect("non-empty script creates an analysis request");
+        let stale_result = run_check_analysis(request);
+
+        page.sync_script("p 0 0 0 2 2 2 material");
+
+        assert!(!page.apply_analysis(stale_result));
+        assert!(page.analysis.is_none());
+        assert!(page.cavity.is_none());
     }
 }

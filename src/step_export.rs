@@ -10,6 +10,13 @@ fn fmt_r(value: f64) -> String {
     crate::text::format_real(value)
 }
 
+/// HEAT3 stores model coordinates in metres; this STEP writer declares millimetres.
+const METRES_TO_MILLIMETRES: f64 = 1_000.0;
+
+fn box_in_step_millimetres(box_: [f64; 6]) -> [f64; 6] {
+    box_.map(|coordinate| coordinate * METRES_TO_MILLIMETRES)
+}
+
 fn step_ref(n: usize) -> String {
     format!("#{}", n)
 }
@@ -298,7 +305,33 @@ fn add_box(writer: &mut StepWriter, box_: [f64; 6], xdir: usize, ydir: usize) ->
     ))
 }
 
-pub fn write_step(path: &Path, boxes: &[[f64; 6]]) -> std::io::Result<()> {
+const SOLID_EPSILON: f64 = 1e-9;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepExportSummary {
+    pub exported_boxes: usize,
+    pub skipped_degenerate_boxes: usize,
+}
+
+pub fn is_exportable_solid(box_: &[f64; 6]) -> bool {
+    (box_[3] - box_[0]).abs() > SOLID_EPSILON
+        && (box_[4] - box_[1]).abs() > SOLID_EPSILON
+        && (box_[5] - box_[2]).abs() > SOLID_EPSILON
+}
+
+pub fn write_step(path: &Path, boxes: &[[f64; 6]]) -> std::io::Result<StepExportSummary> {
+    let exportable_boxes: Vec<[f64; 6]> =
+        boxes.iter().copied().filter(is_exportable_solid).collect();
+    if exportable_boxes.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no exportable solid boxes",
+        ));
+    }
+    let summary = StepExportSummary {
+        exported_boxes: exportable_boxes.len(),
+        skipped_degenerate_boxes: boxes.len() - exportable_boxes.len(),
+    };
     let mut writer = StepWriter::new();
 
     let ctx = writer.add("APPLICATION_CONTEXT('')");
@@ -337,7 +370,7 @@ pub fn write_step(path: &Path, boxes: &[[f64; 6]]) -> std::io::Result<()> {
     let xdir = writer.direction([1.0, 0.0, 0.0]);
     let ydir = writer.direction([0.0, 1.0, 0.0]);
     let uncertainty = writer.add(&format!(
-        "UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-07),{},'','')",
+        "UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-04),{},'','')",
         step_ref(length_unit)
     ));
     let geom_ctx = writer.add(&format!(
@@ -348,15 +381,10 @@ pub fn write_step(path: &Path, boxes: &[[f64; 6]]) -> std::io::Result<()> {
         step_ref(solid_angle_unit)
     ));
 
-    let brep_ids: Vec<usize> = boxes
+    let brep_ids: Vec<usize> = exportable_boxes
         .iter()
         .copied()
-        .filter(|b| {
-            let dx = (b[3] - b[0]).abs();
-            let dy = (b[4] - b[1]).abs();
-            let dz = (b[5] - b[2]).abs();
-            dx > 1e-9 && dy > 1e-9 && dz > 1e-9
-        })
+        .map(box_in_step_millimetres)
         .map(|b| add_box(&mut writer, b, xdir, ydir))
         .collect();
     let items = brep_ids
@@ -403,7 +431,8 @@ pub fn write_step(path: &Path, boxes: &[[f64; 6]]) -> std::io::Result<()> {
     out.push_str(&footer.join("\n"));
     out.push('\n');
 
-    fs::write(path, out)
+    fs::write(path, out)?;
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -501,6 +530,14 @@ mod tests {
     }
 
     #[test]
+    fn step_geometry_converts_heat3_metres_to_millimetres() {
+        assert_eq!(
+            box_in_step_millimetres([0.0, 0.0, 0.0, 1.0, 0.5, 0.1]),
+            [0.0, 0.0, 0.0, 1000.0, 500.0, 100.0]
+        );
+    }
+
+    #[test]
     fn write_step_skips_degenerate_boxes_and_emits_valid_context() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -508,7 +545,7 @@ mod tests {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("heat3-step-{unique}.stp"));
 
-        write_step(
+        let summary = write_step(
             &path,
             &[
                 [0.0, 0.0, 0.0, 1.0, 2.0, 3.0],
@@ -521,8 +558,13 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         assert_eq!(output.matches("MANIFOLD_SOLID_BREP").count(), 1);
+        assert_eq!(summary.exported_boxes, 1);
+        assert_eq!(summary.skipped_degenerate_boxes, 1);
         assert!(output.contains("GEOMETRIC_REPRESENTATION_CONTEXT ( 3 )"));
         assert!(output.contains("GLOBAL_UNIT_ASSIGNED_CONTEXT"));
+        assert!(output.contains("SI_UNIT ( .MILLI. , .METRE. )"));
+        assert!(output.contains("LENGTH_MEASURE(1.E-04)"));
+        assert!(output.contains("CARTESIAN_POINT('',(1000.0,2000.0,3000.0))"));
         assert!(output.contains("PRODUCT_DEFINITION_CONTEXT('',#1,'design')"));
     }
 
@@ -542,5 +584,19 @@ mod tests {
             output.contains("FILE_NAME('heat3-model''s-"),
             "STEP string literal must escape apostrophes: {output}"
         );
+    }
+
+    #[test]
+    fn write_step_rejects_an_all_degenerate_model_without_creating_a_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("heat3-degenerate-{unique}.stp"));
+
+        let error = write_step(&path, &[[0.0, 0.0, 0.0, 0.0, 1.0, 1.0]]).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!path.exists());
     }
 }

@@ -60,6 +60,7 @@ pub fn format_g(value: f64, precision: usize) -> String {
     if value == 0.0 {
         return "0.0".to_string();
     }
+    let precision = precision.max(1);
     let p = precision as i32;
     let sci = format!("{:.prec$e}", value, prec = precision - 1);
     let parts: Vec<&str> = sci.splitn(2, 'e').collect();
@@ -105,6 +106,11 @@ pub fn format_real(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_g_clamps_zero_precision_to_a_safe_value() {
+        assert_eq!(format_g(1.25, 0), format_g(1.25, 1));
+    }
 
     #[test]
     fn split_lines_handles_all_multibyte_python_separators() {

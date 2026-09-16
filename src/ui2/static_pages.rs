@@ -62,6 +62,7 @@ pub struct MaterialSortPage {
     pub names: Vec<String>,
     pub status: Option<(String, bool)>,
     pub mtl_materials: HashMap<String, MtlMaterial>,
+    pub mtl_path: Option<PathBuf>,
     cached_script: String,
 }
 
@@ -160,21 +161,27 @@ impl MaterialSortPage {
                             .spacing(theme::SPACE_2XS)
                             .width(Length::Fill),
                             column![
-                                super::widgets::square_button(
-                                    "↑",
-                                    if index > 0 {
-                                        Some(Message::MaterialMove(index, -1))
-                                    } else {
-                                        None
-                                    }
+                                super::widgets::with_tooltip(
+                                    super::widgets::square_button(
+                                        "↑",
+                                        if index > 0 {
+                                            Some(Message::MaterialMove(index, -1))
+                                        } else {
+                                            None
+                                        }
+                                    ),
+                                    "Переместить материал выше",
                                 ),
-                                super::widgets::square_button(
-                                    "↓",
-                                    if index + 1 < total {
-                                        Some(Message::MaterialMove(index, 1))
-                                    } else {
-                                        None
-                                    }
+                                super::widgets::with_tooltip(
+                                    super::widgets::square_button(
+                                        "↓",
+                                        if index + 1 < total {
+                                            Some(Message::MaterialMove(index, 1))
+                                        } else {
+                                            None
+                                        }
+                                    ),
+                                    "Переместить материал ниже",
                                 ),
                             ]
                             .spacing(theme::SPACE_2XS),
@@ -287,11 +294,17 @@ impl CornerPage {
         self.material_colors = colors;
     }
 
+    pub fn clear_result(&mut self) {
+        self.result = None;
+        self.result_lines.clear();
+    }
+
     pub fn sync_script(&mut self, script: &str) {
         self.lines = crate::parser::parse_script(script);
         if self.cached_script != script {
             self.cached_script = script.to_owned();
             self.cached_pair = crate::corner::detect_constant_pair(script);
+            self.clear_result();
         }
     }
 
@@ -428,6 +441,7 @@ pub struct AirCavitiesPage {
     pub color_error: Option<String>,
     pub specs: Vec<AirCavityMaterialSpec>,
     pub specs_error: Option<String>,
+    pub pending_replacements: Option<Vec<String>>,
     cache_key: String,
 }
 
@@ -448,6 +462,7 @@ impl Default for AirCavitiesPage {
             color_error: None,
             specs: Vec::new(),
             specs_error: None,
+            pending_replacements: None,
             cache_key: String::new(),
         }
     }
@@ -517,6 +532,7 @@ impl AirCavitiesPage {
             return;
         }
         self.cache_key = key;
+        self.pending_replacements = None;
         if self.log_text.trim().is_empty() {
             self.specs.clear();
             self.specs_error = None;
@@ -716,7 +732,37 @@ impl AirCavitiesPage {
             );
         }
 
-        let apply_enabled = self.mtl_path.is_some() && !self.specs.is_empty();
+        if let Some(replacements) = &self.pending_replacements {
+            content = content.push(
+                container(column![
+                    text("Будут перезаписаны существующие материалы MTL:").size(theme::BODY_SIZE),
+                    text(replacements.join(", "))
+                        .size(theme::BODY_SIZE)
+                        .font(super::widgets::mono_font()),
+                    row![
+                        page_button(
+                            "Отмена",
+                            theme::Category::Ghost,
+                            false,
+                            Message::AirCancelApply,
+                        ),
+                        page_button(
+                            "Перезаписать",
+                            theme::Category::Destructive,
+                            true,
+                            Message::AirConfirmApply,
+                        ),
+                    ]
+                    .spacing(theme::PAGE_SPACING),
+                ])
+                .padding(theme::SPACE_MD)
+                .style(|theme| theme::status_panel_style(theme, theme::Status::Warn)),
+            );
+        }
+
+        let apply_enabled = self.mtl_path.is_some()
+            && !self.specs.is_empty()
+            && self.pending_replacements.is_none();
         content = content.push(page_button_maybe(
             "Добавить/обновить материалы",
             theme::Category::Secondary,
@@ -835,7 +881,7 @@ pub fn sort_materials(names: &mut Vec<String>, materials: &HashMap<String, MtlMa
     *names = sort_material_names_by_conductivity(names, materials);
 }
 pub fn parse_mtl(path: &std::path::Path) -> Result<Vec<MtlMaterial>, String> {
-    parse_mtl_file(path, false).map_err(|error| error.to_string())
+    parse_mtl_file(path, true).map_err(|error| error.to_string())
 }
 pub fn apply_air_cavity_upsert(
     path: &std::path::Path,
