@@ -101,8 +101,10 @@ function Invoke-MsiSmokeStep {
 
     $logPath = Join-Path $LogDirectory "$StepName.log"
     $arguments = @($MsiArguments) + @("/qn", "/norestart", "/L*v", $logPath)
-    & "$env:SystemRoot\System32\msiexec.exe" @arguments
-    $exitCode = $LASTEXITCODE
+    $quotedArguments = $arguments | ForEach-Object { '"' + $_.Replace('"', '\"') + '"' }
+    $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" `
+        -ArgumentList ($quotedArguments -join ' ') -PassThru -Wait -NoNewWindow
+    $exitCode = $process.ExitCode
     if ($exitCode -notin @(0, 3010)) {
         $logTail = if (Test-Path -LiteralPath $logPath) {
             (Get-Content -LiteralPath $logPath -Tail 50) -join [Environment]::NewLine
