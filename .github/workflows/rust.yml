@@ -100,16 +100,18 @@ jobs:
             "tools\check-source-hygiene.ps1",
             "tools\e2e\staging-e2e.ps1"
           )
-          foreach ($script in $scripts) {
+          foreach ($candidate in $scripts) {
             $tokens = $null
             $errors = $null
             [System.Management.Automation.Language.Parser]::ParseFile(
-              (Resolve-Path $script), [ref]$tokens, [ref]$errors) | Out-Null
+              (Resolve-Path $candidate), [ref]$tokens, [ref]$errors) | Out-Null
             if ($errors.Count -gt 0) {
-              $errors | ForEach-Object { Write-Error "$script:$($_.Extent.StartLineNumber): $($_.Message)" }
-              throw "PowerShell parse errors in $script"
+              $errors | ForEach-Object {
+                Write-Host ("{0}:{1}: {2}" -f $candidate, $_.Extent.StartLineNumber, $_.Message)
+              }
+              throw "PowerShell parse errors in $candidate"
             }
-            Write-Output "Parsed OK: $script"
+            Write-Output "Parsed OK: $candidate"
           }
 
       - name: Credential-free packaging smoke (Candle + Light)
