@@ -102,9 +102,22 @@ function Invoke-MsiSmokeStep {
     $logPath = Join-Path $LogDirectory "$StepName.log"
     $arguments = @($MsiArguments) + @("/qn", "/norestart", "/L*v", $logPath)
     $quotedArguments = $arguments | ForEach-Object { '"' + $_.Replace('"', '\"') + '"' }
-    $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" `
-        -ArgumentList ($quotedArguments -join ' ') -PassThru -Wait -NoNewWindow
-    $exitCode = $process.ExitCode
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = "$env:SystemRoot\System32\msiexec.exe"
+    $startInfo.Arguments = $quotedArguments -join ' '
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    try {
+        if (-not $process.WaitForExit(180000)) {
+            $process.Kill()
+            $process.WaitForExit()
+            throw "MSI smoke step '$StepName' exceeded the 180-second timeout."
+        }
+        $exitCode = $process.ExitCode
+    } finally {
+        $process.Dispose()
+    }
     if ($exitCode -notin @(0, 3010)) {
         $logTail = if (Test-Path -LiteralPath $logPath) {
             (Get-Content -LiteralPath $logPath -Tail 50) -join [Environment]::NewLine
@@ -149,6 +162,27 @@ function Assert-SmokePayload {
     if ([Convert]::ToBase64String($actualBytes) -ne [Convert]::ToBase64String($ExpectedBytes)) {
         throw "MSI smoke step '$StepName' did not install the expected payload."
     }
+}
+
+function Wait-SmokePayload {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][byte[]]$ExpectedBytes,
+        [Parameter(Mandatory = $true)][string]$StepName,
+        [Parameter(Mandatory = $true)][string]$LogPath
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            Assert-SmokePayload -Path $Path -ExpectedBytes $ExpectedBytes `
+                -StepName $StepName -LogPath $LogPath
+            return
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    Assert-SmokePayload -Path $Path -ExpectedBytes $ExpectedBytes `
+        -StepName $StepName -LogPath $LogPath
 }
 
 if ($SmokeTest) {
@@ -206,7 +240,7 @@ if ($SmokeTest) {
 
         $installer = New-Object -ComObject WindowsInstaller.Installer
         Invoke-MsiSmokeStep -MsiArguments @("/i", $msiV1) -StepName "install-v1" -LogDirectory $smokeDir
-        Assert-SmokePayload -Path (Join-Path $smokeInstallDirectory "heat3_povorotnik.exe") `
+        Wait-SmokePayload -Path (Join-Path $smokeInstallDirectory "heat3_povorotnik.exe") `
             -ExpectedBytes $payloadV1 -StepName "install-v1" -LogPath (Join-Path $smokeDir "install-v1.log")
         $v1ProductCodes = @(Get-RelatedProductCodes -Installer $installer -UpgradeCode $smokeUpgradeCode)
         if ($v1ProductCodes.Count -ne 1) {
@@ -219,7 +253,7 @@ if ($SmokeTest) {
         }
 
         Invoke-MsiSmokeStep -MsiArguments @("/i", $msiV2) -StepName "upgrade-v2" -LogDirectory $smokeDir
-        Assert-SmokePayload -Path (Join-Path $smokeInstallDirectory "heat3_povorotnik.exe") `
+        Wait-SmokePayload -Path (Join-Path $smokeInstallDirectory "heat3_povorotnik.exe") `
             -ExpectedBytes $payloadV2 -StepName "upgrade-v2" -LogPath (Join-Path $smokeDir "upgrade-v2.log")
         $v2ProductCodes = @(Get-RelatedProductCodes -Installer $installer -UpgradeCode $smokeUpgradeCode)
         if ($v2ProductCodes.Count -ne 1) {
