@@ -89,8 +89,7 @@ if ($SmokeTest) {
     # Credential-free validation that the MSI pipeline actually works: no
     # signing, no release binary, only Candle+Light against a dummy payload.
     if (-not (Resolve-WixToolset)) {
-        Write-Output "WiX toolset not found; packaging smoke skipped (trusted releases still fail via -RequireMsi)."
-        exit 0
+        throw "WiX toolset not found; the requested Candle+Light packaging smoke cannot run."
     }
     $smokeDir = Join-Path $env:TEMP ("heat3-package-smoke-" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Force -Path $smokeDir | Out-Null

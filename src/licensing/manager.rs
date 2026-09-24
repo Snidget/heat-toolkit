@@ -337,17 +337,21 @@ impl LicenseManager {
             self.gate.transition_to(state);
             return;
         }
-        if now + CLOCK_ROLLBACK_TOLERANCE < reconciled.max_observed_trusted_time() {
-            self.message = "System clock rollback detected. Connect to the internet.".to_owned();
-            self.gate
-                .transition_to(LicenseState::NeedsOnline(NeedsOnlineReason::ClockRollback));
-            return;
-        }
-        if now >= reconciled.offline_valid_until() {
-            self.message = "Offline lease expired. Connect to the internet.".to_owned();
-            self.gate
-                .transition_to(LicenseState::NeedsOnline(NeedsOnlineReason::LeaseExpired));
-            return;
+        match restored_clock_requirement(&reconciled, now) {
+            Some(NeedsOnlineReason::ClockRollback) => {
+                self.message =
+                    "System clock rollback detected. Connect to the internet.".to_owned();
+                self.gate
+                    .transition_to(LicenseState::NeedsOnline(NeedsOnlineReason::ClockRollback));
+                return;
+            }
+            Some(NeedsOnlineReason::LeaseExpired) => {
+                self.message = "Offline lease expired. Connect to the internet.".to_owned();
+                self.gate
+                    .transition_to(LicenseState::NeedsOnline(NeedsOnlineReason::LeaseExpired));
+                return;
+            }
+            _ => {}
         }
         let hardware = match collect_hardware_identity() {
             Ok(hardware) => hardware,
@@ -538,17 +542,13 @@ fn activate_worker(config: KeygenConfig, store: SecureStore, mut key: String) ->
             Err(_) => Err(WorkerFailure::Storage),
         }
     })();
-    let mut rollback_failed = false;
-    if result.is_err() {
-        if let Some(machine_id) = &created_machine {
-            // Compensating cleanup: the activation never committed locally, so
-            // the server-side machine must not linger and consume a slot. A
-            // failed rollback must be surfaced, not silently swallowed.
-            if client.deactivate_machine(&key, machine_id).is_err() {
-                rollback_failed = true;
-            }
-        }
-    }
+    // Compensating cleanup: the activation never committed locally, so the
+    // server-side machine must not linger and consume a slot. A failed rollback
+    // must be surfaced, not silently swallowed.
+    let rollback_failed = result.is_err()
+        && rollback_created_machine(created_machine.as_deref(), |machine_id| {
+            client.deactivate_machine(&key, machine_id).map(|_| ())
+        });
     key.zeroize();
     let mut worker_result = match result {
         Ok(worker_result) => worker_result,
@@ -564,6 +564,13 @@ fn append_rollback_warning(message: &mut String, rollback_failed: bool) {
             " Внимание: не удалось отменить серверную активацию — слот машины может остаться занятым.",
         );
     }
+}
+
+fn rollback_created_machine(
+    machine_id: Option<&str>,
+    deactivate: impl FnOnce(&str) -> Result<(), KeygenClientError>,
+) -> bool {
+    machine_id.is_some_and(|machine_id| deactivate(machine_id).is_err())
 }
 
 fn refresh_worker(config: KeygenConfig, store: SecureStore) -> WorkerResult {
@@ -666,21 +673,8 @@ fn refresh_worker(config: KeygenConfig, store: SecureStore) -> WorkerResult {
         Err(error) if matches!(&error, WorkerFailure::Client(client_error) if is_transient(client_error)) => {
             match store.load() {
                 Ok(Some(current)) if same_record_binding(&current, &record) => {
-                    if let Some((state, _message)) = blocking_state_from_record(&current) {
-                        WorkerResult {
-                            state,
-                            masked_key: Some(mask_license_key(current.license_key())),
-                            message: "Licensing service unavailable. Continuing within the signed offline lease.".to_owned(),
-                        }
-                    } else if let Some(lease) = lease_from_record(&current) {
-                        WorkerResult {
-                            state: LicenseState::ServiceUnavailable(lease),
-                            masked_key: Some(mask_license_key(current.license_key())),
-                            message: "Licensing service unavailable. Continuing within the signed offline lease.".to_owned(),
-                        }
-                    } else {
-                        failure_result(error, masked)
-                    }
+                    service_unavailable_result(&current, unix_now().unwrap_or(i64::MIN))
+                        .unwrap_or_else(|| failure_result(error, masked))
                 }
                 Ok(Some(current)) => local_record_result(
                     &current,
@@ -909,6 +903,25 @@ fn local_record_result(record: &SecureLicenseRecord, message: &str) -> WorkerRes
     )
 }
 
+fn service_unavailable_result(current: &SecureLicenseRecord, now: i64) -> Option<WorkerResult> {
+    let masked_key = Some(mask_license_key(current.license_key()));
+    if let Some((state, _message)) = blocking_state_from_record(current) {
+        return Some(WorkerResult {
+            state,
+            masked_key,
+            message: "Licensing service unavailable. Continuing within the signed offline lease."
+                .to_owned(),
+        });
+    }
+    let lease = lease_from_record_at(current, now)?;
+    Some(WorkerResult {
+        state: LicenseState::ServiceUnavailable(lease),
+        masked_key,
+        message: "Licensing service unavailable. Continuing within the signed offline lease."
+            .to_owned(),
+    })
+}
+
 fn conflict_worker_result(store: &SecureStore, message: &str) -> WorkerResult {
     match store.load() {
         Ok(Some(record)) => local_record_result(&record, message),
@@ -946,6 +959,16 @@ fn reconcile_restored_record(
     current.set_deactivation_pending(false);
     let persisted = current.clone();
     Ok((Some(persisted), current))
+}
+
+fn restored_clock_requirement(record: &SecureLicenseRecord, now: i64) -> Option<NeedsOnlineReason> {
+    if now.saturating_add(CLOCK_ROLLBACK_TOLERANCE) < record.max_observed_trusted_time() {
+        Some(NeedsOnlineReason::ClockRollback)
+    } else if now >= record.offline_valid_until() {
+        Some(NeedsOnlineReason::LeaseExpired)
+    } else {
+        None
+    }
 }
 
 fn same_record_binding(current: &SecureLicenseRecord, original: &SecureLicenseRecord) -> bool {
@@ -1122,6 +1145,41 @@ mod tests {
             status: 403,
             code: None,
         }));
+    }
+
+    #[test]
+    fn transient_server_outage_keeps_the_existing_signed_lease_unchanged() {
+        let record = SecureLicenseRecord::new(
+            "key",
+            "license-id",
+            "machine-id",
+            "fingerprint",
+            HARDWARE_SCHEMA_VERSION,
+            vec![HardwareComponent {
+                kind: HardwareComponentKind::SystemUuid,
+                digest: "a".repeat(64),
+            }],
+            vec![1, 2, 3],
+            900,
+            950,
+            2_000,
+        )
+        .unwrap();
+        let original = record.clone();
+        let outage = KeygenClientError::Api {
+            status: 503,
+            code: None,
+        };
+        assert!(is_transient(&outage));
+
+        let result = service_unavailable_result(&record, 1_000).unwrap();
+
+        assert!(matches!(
+            result.state,
+            LicenseState::ServiceUnavailable(ref lease)
+                if lease.last_online_at() == 900 && lease.offline_valid_until() == 2_000
+        ));
+        assert!(record == original);
     }
 
     #[test]
@@ -1486,7 +1544,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_reconcile_does_not_persist_untrusted_local_time() {
+    fn restore_after_a_year_ahead_clock_can_recover_after_clock_correction() {
         let record = SecureLicenseRecord::new(
             "key",
             "license-id",
@@ -1500,26 +1558,46 @@ mod tests {
             vec![1, 2, 3],
             100,
             100,
-            1_000,
+            10_000,
         )
         .unwrap();
 
         let (_, reconciled) = reconcile_restored_record(Some(record.clone()), &record).unwrap();
+        let one_year_later = 100 + 365 * 24 * 60 * 60;
+        assert_eq!(
+            restored_clock_requirement(&reconciled, one_year_later),
+            Some(NeedsOnlineReason::LeaseExpired)
+        );
 
-        // The local clock is never observed as a trusted floor here, so an
-        // accidentally far-future clock cannot poison recovery.
+        // Startup at the false future date must not persist that local time.
         assert_eq!(reconciled.max_observed_trusted_time(), 100);
+        assert_eq!(restored_clock_requirement(&reconciled, 500), None);
+        let recovered_lease = lease_from_record_at(&reconciled, 500).unwrap();
+        assert_eq!(recovered_lease.last_online_at(), 100);
+        assert_eq!(recovered_lease.offline_valid_until(), 10_000);
     }
 
     #[test]
     fn rollback_failure_is_surfaced_in_the_activation_message() {
-        let mut message = "Activation failed.".to_owned();
-        append_rollback_warning(&mut message, true);
-        assert!(message.contains("не удалось отменить серверную активацию"));
+        let mut called_with = None;
+        let rollback_failed = rollback_created_machine(Some("created-machine"), |machine_id| {
+            called_with = Some(machine_id.to_owned());
+            Err(KeygenClientError::Api {
+                status: 503,
+                code: None,
+            })
+        });
+        let mut original_failure = "Activation failed while saving the local record.".to_owned();
+        append_rollback_warning(&mut original_failure, rollback_failed);
 
-        let mut clean = "Activation failed.".to_owned();
-        append_rollback_warning(&mut clean, false);
-        assert_eq!(clean, "Activation failed.");
+        assert_eq!(called_with.as_deref(), Some("created-machine"));
+        assert!(original_failure.starts_with("Activation failed while saving the local record."));
+        assert!(original_failure.contains("не удалось отменить серверную активацию"));
+
+        let not_created = rollback_created_machine(None, |_| {
+            panic!("must not deactivate a machine this attempt did not create")
+        });
+        assert!(!not_created);
     }
 
     #[test]

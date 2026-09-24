@@ -615,14 +615,43 @@ mod tests {
     }
 
     #[test]
-    fn step_real_formatting_preserves_thin_features_at_large_offsets() {
+    fn exported_step_keeps_a_thin_feature_at_a_large_offset() {
         // A 0.0001 m feature offset by 1000 m becomes 0.1 mm at 1_000_000 mm.
-        // A six-significant-digit formatter would collapse these coordinates.
-        let offset_mm = 1000.0 * METRES_TO_MILLIMETRES;
-        let thin_mm = (1000.0 + 0.0001) * METRES_TO_MILLIMETRES;
-        assert_eq!(fmt_r(offset_mm), "1000000.0");
-        assert_eq!(fmt_r(thin_mm), "1000000.1");
-        assert_ne!(fmt_r(offset_mm), fmt_r(thin_mm));
+        // Validate the serialized geometry, not only the number formatter.
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("heat3-step-thin-{unique}.stp"));
+        write_step(&path, &[[1000.0, 2.0, 3.0, 1000.0001, 4.0, 5.0]]).unwrap();
+
+        let output = fs::read_to_string(&path).unwrap();
+        let x_coordinates = output
+            .lines()
+            .filter_map(|line| {
+                line.split_once("CARTESIAN_POINT('',(")
+                    .map(|(_, point)| point)
+            })
+            .filter_map(|point| {
+                point
+                    .split_once(',')
+                    .map(|(x, _)| x.parse::<f64>().unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert!(x_coordinates
+            .iter()
+            .any(|x| (*x - 1_000_000.0).abs() < 1e-9));
+        assert!(x_coordinates
+            .iter()
+            .any(|x| (*x - 1_000_000.1).abs() < 1e-9));
+        let minimum = x_coordinates.iter().copied().fold(f64::INFINITY, f64::min);
+        let maximum = x_coordinates
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!((maximum - minimum - 0.1).abs() < 1e-9);
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

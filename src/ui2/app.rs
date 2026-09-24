@@ -347,13 +347,13 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             super::platform::apply_titlebar_theme(is_dark(app));
             // Theme change affects canvas colors; invalidate preview caches.
-            app.turner.preview.cache.clear();
-            app.turner_2d.preview.cache.clear();
+            app.turner.preview.invalidate_cache();
+            app.turner_2d.preview.invalidate_cache();
         }
         Message::SettingsGrid(show) => {
             app.show_grid = show;
-            app.turner.preview.cache.clear();
-            app.turner_2d.preview.cache.clear();
+            app.turner.preview.invalidate_cache();
+            app.turner_2d.preview.invalidate_cache();
         }
         Message::SystemThemeTick => {
             if app.theme_mode == AppTheme::System {
@@ -361,8 +361,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 if app.last_system_dark != Some(dark) {
                     app.last_system_dark = Some(dark);
                     super::platform::apply_titlebar_theme(dark);
-                    app.turner.preview.cache.clear();
-                    app.turner_2d.preview.cache.clear();
+                    app.turner.preview.invalidate_cache();
+                    app.turner_2d.preview.invalidate_cache();
                 }
             }
         }

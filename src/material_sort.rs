@@ -506,6 +506,14 @@ fn atomic_temp_suffix() -> String {
 }
 
 pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomic_write_bytes_with_replace(path, bytes, atomic_replace)
+}
+
+fn atomic_write_bytes_with_replace(
+    path: &Path,
+    bytes: &[u8],
+    replace: impl FnOnce(&Path, &Path) -> Result<(), String>,
+) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "cannot write file: target path has no parent".to_owned())?;
@@ -522,7 +530,7 @@ pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .map_err(|e| format!("cannot write file: {}", e))?;
         file.sync_all()
             .map_err(|e| format!("cannot write file: {}", e))?;
-        atomic_replace(&temporary, path)
+        replace(&temporary, path)
     })();
 
     if result.is_err() {
@@ -643,4 +651,41 @@ pub fn sort_material_names_by_conductivity(
         }
     });
     indexed.into_iter().map(|(_, n)| n.clone()).collect()
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+
+    #[test]
+    fn failed_atomic_replace_preserves_existing_destination_and_cleans_temp_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "heat3-atomic-write-failure-{}",
+            atomic_temp_suffix()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("export.stp");
+        fs::write(&path, b"previous valid export").unwrap();
+
+        let error =
+            atomic_write_bytes_with_replace(&path, b"new export", |temporary, destination| {
+                assert!(
+                    temporary.exists(),
+                    "complete replacement file is staged first"
+                );
+                assert_eq!(fs::read(temporary).unwrap(), b"new export");
+                assert_eq!(destination, path);
+                Err("injected atomic replace failure".to_owned())
+            })
+            .unwrap_err();
+
+        assert_eq!(error, "injected atomic replace failure");
+        assert_eq!(fs::read(&path).unwrap(), b"previous valid export");
+        let remaining = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec![path.file_name().unwrap()]);
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

@@ -73,14 +73,17 @@ fn status_of(response: &Value) -> Option<String> {
     string_at(response, "/data/attributes/status").map(str::to_owned)
 }
 
-/// Best-effort compact state snapshot (`status`) captured before a mutation so
-/// the audit journal can reconstruct what a state-changing command changed from.
-/// A failed read leaves the field empty rather than failing the operation.
-fn capture_state(client: &AdminClient, id: &str) -> Option<String> {
-    client
-        .get(id)
-        .ok()
-        .and_then(|response| status_of(&response))
+/// Capture the compact license status before each mutation. A failed read
+/// cancels the operation so the audit journal can reconstruct the change.
+fn capture_before_and_mutate<T>(
+    id: &str,
+    get: impl FnOnce(&str) -> Result<Value, String>,
+    mutate: impl FnOnce() -> Result<T, String>,
+) -> Result<(String, Result<T, String>), String> {
+    let response = get(id)?;
+    let before =
+        status_of(&response).ok_or("Keygen did not return license status; mutation cancelled")?;
+    Ok((before, mutate()))
 }
 
 fn execute(client: &AdminClient, command: Command) -> (AuditOutcome, Result<(), String>) {
@@ -99,49 +102,82 @@ fn execute(client: &AdminClient, command: Command) -> (AuditOutcome, Result<(), 
             Command::List { limit } => print_safe(client.list(limit)?)?,
             Command::Show { id } => print_safe(client.get(&id)?)?,
             Command::Suspend { id } => {
-                outcome.before_state = capture_state(client, &id);
-                let response = client.action(&id, "suspend", Method::POST)?;
+                let (before, response) = capture_before_and_mutate(
+                    &id,
+                    |id| client.get(id),
+                    || client.action(&id, "suspend", Method::POST),
+                )?;
+                outcome.before_state = Some(before);
+                let response = response?;
                 outcome.license_id = Some(id.clone());
                 outcome.after_state = status_of(&response);
                 print_safe(response)?;
             }
             Command::Reinstate { id } => {
-                outcome.before_state = capture_state(client, &id);
-                let response = client.action(&id, "reinstate", Method::POST)?;
+                let (before, response) = capture_before_and_mutate(
+                    &id,
+                    |id| client.get(id),
+                    || client.action(&id, "reinstate", Method::POST),
+                )?;
+                outcome.before_state = Some(before);
+                let response = response?;
                 outcome.license_id = Some(id.clone());
                 outcome.after_state = status_of(&response);
                 print_safe(response)?;
             }
             Command::Renew { id } => {
-                outcome.before_state = capture_state(client, &id);
-                let response = client.action(&id, "renew", Method::POST)?;
+                let (before, response) = capture_before_and_mutate(
+                    &id,
+                    |id| client.get(id),
+                    || client.action(&id, "renew", Method::POST),
+                )?;
+                outcome.before_state = Some(before);
+                let response = response?;
                 outcome.license_id = Some(id.clone());
                 outcome.after_state = status_of(&response);
                 print_safe(response)?;
             }
             Command::ResetUsage { id, confirm } => {
                 require_confirmation(&id, &confirm)?;
-                outcome.before_state = capture_state(client, &id);
-                let response = client.action(&id, "reset-usage", Method::POST)?;
+                let (before, response) = capture_before_and_mutate(
+                    &id,
+                    |id| client.get(id),
+                    || client.action(&id, "reset-usage", Method::POST),
+                )?;
+                outcome.before_state = Some(before);
+                let response = response?;
                 outcome.license_id = Some(id.clone());
                 outcome.after_state = Some("usage-reset".to_owned());
                 print_safe(response)?;
             }
             Command::ResetMachines { id, confirm } => {
                 require_confirmation(&id, &confirm)?;
-                outcome.before_state = capture_state(client, &id);
-                let ids = client.list_all_machines(&id)?;
-                for machine_id in &ids {
-                    client.delete_machine(machine_id)?;
-                }
+                let (before, ids) = capture_before_and_mutate(
+                    &id,
+                    |id| client.get(id),
+                    || {
+                        let ids = client.list_all_machines(&id)?;
+                        for machine_id in &ids {
+                            client.delete_machine(machine_id)?;
+                        }
+                        Ok(ids)
+                    },
+                )?;
+                outcome.before_state = Some(before);
+                let ids = ids?;
                 outcome.license_id = Some(id.clone());
                 outcome.after_state = Some(format!("machines-deleted:{}", ids.len()));
                 println!("Удалено активаций: {}", ids.len());
             }
             Command::Revoke { id, confirm } => {
                 require_confirmation(&id, &confirm)?;
-                outcome.before_state = capture_state(client, &id);
-                client.action(&id, "revoke", Method::DELETE)?;
+                let (before, result) = capture_before_and_mutate(
+                    &id,
+                    |id| client.get(id),
+                    || client.action(&id, "revoke", Method::DELETE).map(|_| ()),
+                )?;
+                outcome.before_state = Some(before);
+                result?;
                 outcome.license_id = Some(id.clone());
                 outcome.after_state = Some("revoked".to_owned());
                 println!("Лицензия {id} безвозвратно отозвана.");
@@ -1333,6 +1369,48 @@ mod tests {
             .lines()
             .map(|line| serde_json::from_str::<AuditEntry>(line).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn mutations_are_blocked_when_before_state_cannot_be_captured() {
+        let mutated = std::cell::Cell::new(false);
+        let result = capture_before_and_mutate(
+            "license-1",
+            |_| Err("injected GET failure".to_owned()),
+            || {
+                mutated.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(
+            !mutated.get(),
+            "mutation must not run after a failed state read"
+        );
+
+        let result = capture_before_and_mutate(
+            "license-1",
+            |_| Ok(json!({"data": {"attributes": {}}})),
+            || {
+                mutated.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err(), "missing status must also fail closed");
+        assert!(!mutated.get());
+    }
+
+    #[test]
+    fn captured_before_state_is_retained_when_the_mutation_fails() {
+        let (before, mutation) = capture_before_and_mutate(
+            "license-1",
+            |_| Ok(json!({"data": {"attributes": {"status": "active"}}})),
+            || Err::<(), _>("injected action failure".to_owned()),
+        )
+        .unwrap();
+
+        assert_eq!(before, "active");
+        assert_eq!(mutation.unwrap_err(), "injected action failure");
     }
 
     #[test]

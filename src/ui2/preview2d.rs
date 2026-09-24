@@ -122,6 +122,8 @@ pub struct Preview2D {
     pub rects: Vec<Rect2D>,
     pub show_grid: bool,
     pub cache: Cache,
+    #[cfg(test)]
+    cache_invalidation_epoch: std::cell::Cell<u64>,
 }
 
 impl Default for Preview2D {
@@ -132,27 +134,36 @@ impl Default for Preview2D {
             rects: Vec::new(),
             show_grid: true,
             cache: Cache::new(),
+            #[cfg(test)]
+            cache_invalidation_epoch: std::cell::Cell::new(0),
         }
     }
 }
 
 impl Preview2D {
+    pub fn invalidate_cache(&self) {
+        self.cache.clear();
+        #[cfg(test)]
+        self.cache_invalidation_epoch
+            .set(self.cache_invalidation_epoch.get().wrapping_add(1));
+    }
+
     pub fn set_segments(&mut self, lines: &[ScriptLine]) {
         self.lines = lines.to_vec();
         self.rects.clear();
-        self.cache.clear();
+        self.invalidate_cache();
     }
 
     pub fn set_rects(&mut self, rects: &[Rect2D]) {
         self.rects = rects.to_vec();
         self.lines.clear();
-        self.cache.clear();
+        self.invalidate_cache();
     }
 
     pub fn set_projection(&mut self, projection: Projection) {
         if self.projection != projection {
             self.projection = projection;
-            self.cache.clear();
+            self.invalidate_cache();
         }
     }
 
@@ -341,7 +352,7 @@ impl Program<CanvasMessage> for Preview2D {
             let hovered = self.hit_test(point, bounds);
             if hovered != state.hovered {
                 state.hovered = hovered;
-                self.cache.clear();
+                self.invalidate_cache();
                 return Some(canvas::Action::publish(CanvasMessage::Hover(hovered)));
             }
         }
@@ -387,21 +398,32 @@ mod tests {
     }
 
     #[test]
-    fn data_and_grid_changes_clear_the_page_owned_render_cache() {
+    fn data_and_projection_changes_advance_the_render_cache_generation() {
         let mut preview = Preview2D::default();
         preview.set_segments(&[line(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)]);
-        // The cache read by `draw` is the same field these setters clear.
-        assert!(format!("{:?}", preview.cache).starts_with("Cache::Empty"));
 
+        // Treat the current generation as a previously rendered frame. Iced's
+        // Cache has no public populated-state constructor, so the invalidation
+        // epoch verifies the generation transition directly.
+        let rendered_generation = preview.cache_invalidation_epoch.get();
         preview.set_projection(Projection::XZ);
-        assert!(format!("{:?}", preview.cache).starts_with("Cache::Empty"));
+        assert_ne!(
+            preview.cache_invalidation_epoch.get(),
+            rendered_generation,
+            "projection changes must invalidate already-rendered geometry"
+        );
 
+        let rendered_generation = preview.cache_invalidation_epoch.get();
         preview.set_rects(&[Rect2D {
             x1: 0.0,
             y1: 0.0,
             x2: 1.0,
             y2: 1.0,
         }]);
-        assert!(format!("{:?}", preview.cache).starts_with("Cache::Empty"));
+        assert_ne!(
+            preview.cache_invalidation_epoch.get(),
+            rendered_generation,
+            "new data must invalidate the current rendered geometry"
+        );
     }
 }
