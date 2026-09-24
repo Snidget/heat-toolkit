@@ -20,14 +20,20 @@ pub enum StandardView {
     Bottom,
 }
 
+/// HEAT3 uses a Z-up engineering coordinate system (X/Y horizontal, Z vertical).
+/// The camera direction is `(cos el * sin az, cos el * cos az, sin el)`, so:
+/// - Front/Back look along ±Y (XZ plane),
+/// - Left/Right look along ±X (YZ plane),
+/// - Top/Bottom look along ±Z (XY plane).
 pub fn standard_view_angles(view: StandardView) -> (f64, f64) {
+    use std::f64::consts::{FRAC_PI_2, PI};
     match view {
         StandardView::Front => (0.0, 0.0),
-        StandardView::Back => (std::f64::consts::PI, 0.0),
-        StandardView::Right => (-std::f64::consts::FRAC_PI_2, 0.0),
-        StandardView::Left => (std::f64::consts::FRAC_PI_2, 0.0),
-        StandardView::Top => (0.0, std::f64::consts::FRAC_PI_2),
-        StandardView::Bottom => (0.0, -std::f64::consts::FRAC_PI_2),
+        StandardView::Back => (PI, 0.0),
+        StandardView::Right => (FRAC_PI_2, 0.0),
+        StandardView::Left => (-FRAC_PI_2, 0.0),
+        StandardView::Top => (0.0, FRAC_PI_2),
+        StandardView::Bottom => (0.0, -FRAC_PI_2),
     }
 }
 
@@ -51,8 +57,9 @@ pub enum Canvas3DMessage {
 
 /// Направление условного источника света (совпадает с egui renderer3d).
 fn light_dir() -> (f64, f64, f64) {
-    let len = (0.4f64 * 0.4 + 0.9 * 0.9 + 0.5 * 0.5).sqrt();
-    (0.4 / len, 0.9 / len, 0.5 / len)
+    // Bias toward +Z so the top faces of a Z-up HEAT3 model are brightest.
+    let len = (0.4f64 * 0.4 + 0.5 * 0.5 + 0.9 * 0.9).sqrt();
+    (0.4 / len, 0.5 / len, 0.9 / len)
 }
 
 fn label_char(line: &ScriptLine) -> char {
@@ -214,7 +221,8 @@ fn build_camera(
 ) -> Option<(Camera, [f64; 3], f64)> {
     let (min, max, center, radius) = world_aabb(lines)?;
     let el = elevation.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
-    let dir = (el.cos() * azimuth.sin(), el.sin(), el.cos() * azimuth.cos());
+    // Z-up direction: horizontal component rotates in XY, vertical along Z.
+    let dir = (el.cos() * azimuth.sin(), el.cos() * azimuth.cos(), el.sin());
 
     let dist = radius * 6.0 + 1.0;
     let position = [
@@ -223,11 +231,13 @@ fn build_camera(
         center[2] + dir.2 * dist,
     ];
 
-    // Look-at базис: forward от камеры к центру, up = Y.
+    // Look-at basis: forward from camera to center, world up = Z (HEAT3).
+    // At the poles the reference up is parallel to forward, so fall back to a
+    // deterministic alternate reference axis (Y) to keep the basis valid.
     let (fx, fy, fz) = (-dir.0, -dir.1, -dir.2);
-    let (rx, ry, rz) = cross((fx, fy, fz), (0.0, 1.0, 0.0));
-    let (rx, ry, rz) = if norm((rx, ry, rz)) < 1e-12 {
-        (1.0, 0.0, 0.0)
+    let (rx, ry, rz) = cross((fx, fy, fz), (0.0, 0.0, 1.0));
+    let (rx, ry, rz) = if norm((rx, ry, rz)) < 1e-9 {
+        normalize(cross((fx, fy, fz), (0.0, 1.0, 0.0)))
     } else {
         normalize((rx, ry, rz))
     };
@@ -620,21 +630,59 @@ mod tests {
     }
 
     #[test]
-    fn top_and_bottom_views_are_axis_aligned() {
-        let lines = vec![crate::parser::parse_line("p 0 0 0 1 1 1 material")];
+    fn standard_views_are_axis_aligned_in_the_heat3_z_up_system() {
+        // Asymmetric extents so a Y/Z permutation cannot pass by accident.
+        let lines = vec![crate::parser::parse_line("p 0 0 0 1 2 3 material")];
         let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(400.0, 300.0));
 
-        for (view, expected_y) in [(StandardView::Top, 1.0), (StandardView::Bottom, -1.0)] {
+        let expect = |view: StandardView| -> [f64; 3] {
+            match view {
+                StandardView::Front => [0.0, 1.0, 0.0],
+                StandardView::Back => [0.0, -1.0, 0.0],
+                StandardView::Right => [1.0, 0.0, 0.0],
+                StandardView::Left => [-1.0, 0.0, 0.0],
+                StandardView::Top => [0.0, 0.0, 1.0],
+                StandardView::Bottom => [0.0, 0.0, -1.0],
+            }
+        };
+
+        for view in [
+            StandardView::Front,
+            StandardView::Back,
+            StandardView::Left,
+            StandardView::Right,
+            StandardView::Top,
+            StandardView::Bottom,
+        ] {
             let (azimuth, elevation) = standard_view_angles(view);
             let (camera, center, _) = build_camera(&lines, azimuth, elevation, bounds).unwrap();
-            let camera_y = camera.position[1] - center[1];
-
-            assert!((camera.position[0] - center[0]).abs() < 1e-12);
-            assert!((camera.position[2] - center[2]).abs() < 1e-12);
-            assert!(camera_y * expected_y > 0.0);
-            assert!(camera.forward[0].abs() < 1e-12);
-            assert!((camera.forward[1] + expected_y).abs() < 1e-12);
-            assert!(camera.forward[2].abs() < 1e-12);
+            // Camera sits along the expected HEAT3 axis.
+            let offset = [
+                camera.position[0] - center[0],
+                camera.position[1] - center[1],
+                camera.position[2] - center[2],
+            ];
+            let expected = expect(view);
+            for (axis, expected_value) in expected.iter().enumerate() {
+                assert!(
+                    offset[axis] * expected_value > 0.0 || offset[axis].abs() < 1e-9,
+                    "{view:?} axis {axis}: offset {offset:?} vs expected {expected:?}"
+                );
+                // Forward points back toward the scene center, along the axis.
+                assert!(
+                    (camera.forward[axis] + expected_value).abs() < 1e-9,
+                    "{view:?} forward {:?}",
+                    camera.forward
+                );
+            }
+            // The camera basis is never degenerate at the poles.
+            let right_len =
+                (camera.right[0].powi(2) + camera.right[1].powi(2) + camera.right[2].powi(2))
+                    .sqrt();
+            let up_len =
+                (camera.up[0].powi(2) + camera.up[1].powi(2) + camera.up[2].powi(2)).sqrt();
+            assert!(right_len > 0.5, "{view:?} right basis degenerate");
+            assert!(up_len > 0.5, "{view:?} up basis degenerate");
         }
     }
 }

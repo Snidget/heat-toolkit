@@ -149,6 +149,9 @@ pub struct App {
     step_3d: Step3DPage,
     script_text: String,
     script_text_2d: String,
+    /// Single explicit source of 3D material colors shared by STEP/Corner.
+    active_mtl_path: Option<PathBuf>,
+    active_mtl_colors: HashMap<String, iced::Color>,
     modifiers: iced::keyboard::Modifiers,
     last_system_dark: Option<bool>,
 }
@@ -197,10 +200,43 @@ impl Default for App {
             step_3d: Step3DPage::default(),
             script_text: String::new(),
             script_text_2d: String::new(),
+            active_mtl_path: None,
+            active_mtl_colors: HashMap::new(),
             modifiers: iced::keyboard::Modifiers::default(),
             last_system_dark: None,
         }
     }
+}
+
+fn active_mtl_label(app: &App) -> Option<String> {
+    app.active_mtl_path
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+/// Publishes the single shared 3D material source to every consumer so STEP and
+/// Corner can neither diverge nor present an unclear, order-dependent origin.
+fn publish_active_mtl(app: &mut App) {
+    let label = active_mtl_label(app);
+    app.step_3d
+        .set_material_colors(app.active_mtl_colors.clone());
+    app.step_3d.set_mtl_source(label.clone());
+    app.corner
+        .set_material_colors(app.active_mtl_colors.clone());
+    app.corner.set_mtl_source(label);
+}
+
+fn set_active_mtl(app: &mut App, path: &Path, colors: HashMap<String, iced::Color>) {
+    app.active_mtl_path = Some(path.to_path_buf());
+    app.active_mtl_colors = colors;
+    publish_active_mtl(app);
+}
+
+fn clear_active_mtl(app: &mut App) {
+    app.active_mtl_path = None;
+    app.active_mtl_colors.clear();
+    publish_active_mtl(app);
 }
 
 fn start_check_analysis(request: super::interactive_pages::CheckAnalysisRequest) -> Task<Message> {
@@ -283,6 +319,12 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
         && !snapshot.access.is_allowed()
         && !message_allowed_while_unlicensed(&message)
     {
+        // A background analysis that completes while access is denied must not
+        // be lost: mark the check analysis dirty so it is rescheduled once
+        // access is restored. The authorization boundary itself is preserved.
+        if matches!(message, Message::CheckAnalysisCompleted(_)) {
+            app.check.mark_pending();
+        }
         return Task::none();
     }
     let mut task = Task::none();
@@ -305,13 +347,13 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             super::platform::apply_titlebar_theme(is_dark(app));
             // Theme change affects canvas colors; invalidate preview caches.
-            app.turner.preview.cache.clear();
-            app.turner_2d.preview.cache.clear();
+            app.turner.preview.invalidate_cache();
+            app.turner_2d.preview.invalidate_cache();
         }
         Message::SettingsGrid(show) => {
             app.show_grid = show;
-            app.turner.preview.cache.clear();
-            app.turner_2d.preview.cache.clear();
+            app.turner.preview.invalidate_cache();
+            app.turner_2d.preview.invalidate_cache();
         }
         Message::SystemThemeTick => {
             if app.theme_mode == AppTheme::System {
@@ -319,8 +361,8 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                 if app.last_system_dark != Some(dark) {
                     app.last_system_dark = Some(dark);
                     super::platform::apply_titlebar_theme(dark);
-                    app.turner.preview.cache.clear();
-                    app.turner_2d.preview.cache.clear();
+                    app.turner.preview.invalidate_cache();
+                    app.turner_2d.preview.invalidate_cache();
                 }
             }
         }
@@ -361,8 +403,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                         app.report.mtl_path = Some(path.clone());
                         app.report.refresh_items();
                         let colors = app.report.material_color_map();
-                        app.step_3d.set_material_colors(colors.clone());
-                        app.corner.set_material_colors(colors);
+                        set_active_mtl(app, path.as_path(), colors);
                         app.report.status =
                             Some((format!("Материалов загружено из MTL: {count}."), false));
                     }
@@ -433,8 +474,7 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
                         app.material_sort.mtl_materials = map;
                         app.material_sort.mtl_path = Some(path.clone());
                         let colors = app.material_sort.color_map();
-                        app.step_3d.set_material_colors(colors.clone());
-                        app.corner.set_material_colors(colors);
+                        set_active_mtl(app, path.as_path(), colors);
                         app.material_sort.status =
                             Some((format!("Материалов загружено из MTL: {count}."), false));
                     }
@@ -523,14 +563,14 @@ pub fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         },
         Message::CornerCreate => {
-            if let Some(result) = crate::ui2::static_pages::create_corner_script(
-                &app.script_text,
-                app.corner.direction,
-            ) {
-                app.corner.result = Some(result.clone());
-                app.corner.result_lines = crate::parser::parse_script(&result);
-                app.script_text = result;
-                task = sync_script_fields(app);
+            // Generate from the stable shared base and keep the variant local.
+            // The shared script must not silently become the generated result,
+            // otherwise direction exploration is cumulative and self-invalidating.
+            let base = app.corner.base_script().to_owned();
+            if let Some(result) =
+                crate::ui2::static_pages::create_corner_script(&base, app.corner.direction)
+            {
+                app.corner.set_result(result);
             }
         }
         Message::CornerView(view) => {
@@ -987,6 +1027,12 @@ fn apply_air_cavity_upsert(app: &mut App) {
                 path.as_path(),
             );
             let mut reload_errors = Vec::new();
+            // Only a reload that produced a usable map from the active source
+            // may refresh the shared 3D colors; otherwise the source is cleared.
+            let active_mutated = app
+                .active_mtl_path
+                .as_ref()
+                .is_some_and(|active| same_mtl_path(active, path.as_path()));
             let mut refreshed_colors = None;
             match report_reload {
                 Ok(true) => {
@@ -1014,14 +1060,13 @@ fn apply_air_cavity_upsert(app: &mut App) {
                     reload_errors.push("сортировка".to_owned());
                 }
             }
-            if reload_errors.is_empty() {
-                if let Some(colors) = refreshed_colors {
-                    app.step_3d.set_material_colors(colors.clone());
-                    app.corner.set_material_colors(colors);
+            if active_mutated {
+                match refreshed_colors {
+                    Some(colors) if reload_errors.is_empty() => {
+                        set_active_mtl(app, path.as_path(), colors);
+                    }
+                    _ => clear_active_mtl(app),
                 }
-            } else {
-                app.step_3d.set_material_colors(HashMap::new());
-                app.corner.set_material_colors(HashMap::new());
             }
             let status = format!(
                 "Готово. Обновлено: {}, добавлено: {}",
@@ -1354,6 +1399,88 @@ mod tests {
 
         assert_eq!(app.turner_2d.preview.rects.len(), expected_rectangles);
         assert_eq!(app.check.cached_script, app.script_text);
+    }
+
+    #[test]
+    fn corner_generation_keeps_result_local_and_stable_across_directions() {
+        let mut app = App {
+            license_manager: crate::licensing::LicenseManager::development_for_tests(),
+            ..Default::default()
+        };
+        // Pseudo-2D material section: constant X, so a corner can be generated.
+        let _ = replace_shared_script(
+            &mut app,
+            "p 0 0 0 0.1 1 1 material\np 0.1 0 0 0.2 1 1 material".to_owned(),
+        );
+        let base = app.script_text.clone();
+
+        let _ = update(&mut app, Message::CornerCreate);
+        assert!(
+            app.corner.result.is_some(),
+            "generated result survives sync"
+        );
+        assert_eq!(app.script_text, base, "shared source is not overwritten");
+
+        let first = app.corner.result.clone().unwrap();
+        let _ = update(&mut app, Message::CornerDirection(1));
+        let _ = update(&mut app, Message::CornerCreate);
+        let second = app.corner.result.clone().unwrap();
+        assert_ne!(first, second, "each direction regenerates");
+        assert_eq!(app.script_text, base, "base remains stable");
+
+        // External source change invalidates the derived result.
+        let _ = replace_shared_script(&mut app, "p 0 0 0 1 1 1 other".to_owned());
+        assert!(
+            app.corner.result.is_none(),
+            "external change invalidates result"
+        );
+    }
+
+    #[test]
+    fn active_mtl_source_is_single_and_inspectable_for_step_and_corner() {
+        let mut app = App::default();
+        let a = Path::new("A.mtl");
+        let b = Path::new("B.mtl");
+        let red = HashMap::from([("brick".to_owned(), iced::Color::from_rgb(1.0, 0.0, 0.0))]);
+        let blue = HashMap::from([("brick".to_owned(), iced::Color::from_rgb(0.0, 0.0, 1.0))]);
+
+        set_active_mtl(&mut app, a, red.clone());
+        assert_eq!(app.active_mtl_path.as_deref(), Some(a));
+        assert_eq!(app.step_3d.mtl_source.as_deref(), Some("A.mtl"));
+        assert_eq!(app.corner.mtl_source.as_deref(), Some("A.mtl"));
+        assert_eq!(app.step_3d.material_colors["brick"], red["brick"]);
+
+        // A later explicit load deterministically republishes to both consumers.
+        set_active_mtl(&mut app, b, blue.clone());
+        assert_eq!(app.active_mtl_path.as_deref(), Some(b));
+        assert_eq!(app.step_3d.mtl_source.as_deref(), Some("B.mtl"));
+        assert_eq!(app.corner.mtl_source.as_deref(), Some("B.mtl"));
+        assert_eq!(app.corner.material_colors["brick"], blue["brick"]);
+
+        clear_active_mtl(&mut app);
+        assert!(app.active_mtl_path.is_none());
+        assert!(app.step_3d.mtl_source.is_none());
+        assert!(app.corner.mtl_source.is_none());
+        assert!(app.step_3d.material_colors.is_empty());
+    }
+
+    #[test]
+    fn denied_analysis_completion_reschedules_instead_of_losing_work() {
+        // Default manager is unlicensed/fail-closed when no compile-time config exists.
+        let mut app = App::default();
+        let request = app
+            .check
+            .sync_script("p 0 0 0 1 1 1 material")
+            .expect("non-empty script schedules analysis");
+        assert!(!app.check.is_pending(), "sync launched immediate analysis");
+
+        let result = crate::ui2::interactive_pages::run_check_analysis(request);
+        let _ = update(&mut app, Message::CheckAnalysisCompleted(result));
+
+        assert!(
+            app.check.is_pending(),
+            "dropped completion must mark analysis dirty for rescheduling"
+        );
     }
 
     #[test]

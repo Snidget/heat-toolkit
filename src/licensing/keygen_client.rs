@@ -397,20 +397,10 @@ impl KeygenClient {
         let date = header(&response, DATE.as_str())?;
         let digest = header(&response, "digest")?;
         let signature = header(&response, "keygen-signature")?;
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_RESPONSE_SIZE as u64)
-        {
-            return Err(KeygenClientError::ResponseTooLarge);
-        }
-        let mut body = Vec::new();
-        response
-            .take(MAX_RESPONSE_SIZE as u64 + 1)
-            .read_to_end(&mut body)
-            .map_err(|_| KeygenClientError::Transport)?;
-        if body.len() > MAX_RESPONSE_SIZE {
-            return Err(KeygenClientError::ResponseTooLarge);
-        }
+        // A transient 429/5xx status must survive the pre-parse body pipeline:
+        // an oversized/truncated/read-failing outage body is still the same
+        // service outage, not a generic response-size or transport failure.
+        let body = read_bounded_response_body(status, response.content_length(), response)?;
 
         let path_and_query = match url.query() {
             Some(query) => format!("{}?{query}", url.path()),
@@ -667,6 +657,45 @@ fn is_transient_status(status: StatusCode) -> bool {
     status.as_u16() == 429 || status.is_server_error()
 }
 
+/// Classifies a pre-parse body-pipeline failure. A transient 429/5xx status is
+/// preserved as a service-outage classification so a still-valid offline lease
+/// is not dropped just because the outage body was oversized or unreadable.
+fn preserve_transient_status(status: StatusCode, fallback: KeygenClientError) -> KeygenClientError {
+    if is_transient_status(status) {
+        KeygenClientError::Api {
+            status: status.as_u16(),
+            code: None,
+        }
+    } else {
+        fallback
+    }
+}
+
+fn read_bounded_response_body(
+    status: StatusCode,
+    content_length: Option<u64>,
+    reader: impl Read,
+) -> Result<Vec<u8>, KeygenClientError> {
+    if content_length.is_some_and(|length| length > MAX_RESPONSE_SIZE as u64) {
+        return Err(preserve_transient_status(
+            status,
+            KeygenClientError::ResponseTooLarge,
+        ));
+    }
+    let mut body = Vec::new();
+    reader
+        .take(MAX_RESPONSE_SIZE as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| preserve_transient_status(status, KeygenClientError::Transport))?;
+    if body.len() > MAX_RESPONSE_SIZE {
+        return Err(preserve_transient_status(
+            status,
+            KeygenClientError::ResponseTooLarge,
+        ));
+    }
+    Ok(body)
+}
+
 fn parse_api_error(status: StatusCode, body: &[u8]) -> KeygenClientError {
     let code = serde_json::from_slice::<Value>(body)
         .ok()
@@ -802,6 +831,58 @@ mod tests {
             }],
             strength: HardwareIdentityStrength::Weak,
         }
+    }
+
+    #[test]
+    fn signed_transient_responses_keep_outage_status_for_oversized_or_unreadable_bodies() {
+        use reqwest::StatusCode as S;
+        use std::io::{self, Cursor};
+
+        struct FailingReader;
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "injected body failure",
+                ))
+            }
+        }
+
+        // These cases enter the body pipeline after execute() has obtained the
+        // Keygen signature envelope headers. The 429/503 classification must
+        // survive either failure instead of becoming a generic parse failure.
+        assert_eq!(
+            read_bounded_response_body(
+                S::SERVICE_UNAVAILABLE,
+                Some(MAX_RESPONSE_SIZE as u64 + 1),
+                Cursor::new(Vec::<u8>::new()),
+            ),
+            Err(KeygenClientError::Api {
+                status: 503,
+                code: None,
+            })
+        );
+        assert_eq!(
+            read_bounded_response_body(S::TOO_MANY_REQUESTS, None, FailingReader),
+            Err(KeygenClientError::Api {
+                status: 429,
+                code: None,
+            })
+        );
+
+        // Non-transient errors retain their specific body-pipeline failure.
+        assert_eq!(
+            read_bounded_response_body(S::BAD_REQUEST, None, FailingReader),
+            Err(KeygenClientError::Transport)
+        );
+        assert_eq!(
+            read_bounded_response_body(
+                S::BAD_REQUEST,
+                Some(MAX_RESPONSE_SIZE as u64 + 1),
+                Cursor::new(Vec::<u8>::new()),
+            ),
+            Err(KeygenClientError::ResponseTooLarge)
+        );
     }
 
     #[test]

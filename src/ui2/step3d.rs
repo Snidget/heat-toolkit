@@ -5,7 +5,9 @@ use iced::{Element, Length};
 
 use crate::clipboard;
 use crate::parser::{parse_script, ScriptLine};
-use crate::step_export::{is_exportable_solid, write_step};
+use crate::step_export::{
+    exportable_p_boxes, is_exportable_solid, step_export_blockers, write_step,
+};
 
 use super::app::Message;
 use super::preview3d::{self, Canvas3DMessage, Preview3D, StandardView};
@@ -20,6 +22,12 @@ pub struct Step3DPage {
     pub lines: Vec<ScriptLine>,
     pub active_view: Option<StandardView>,
     pub material_colors: HashMap<String, iced::Color>,
+    /// File name of the active MTL that supplies material colors, if any.
+    pub mtl_source: Option<String>,
+    /// Preview-limited lines (only exportable `p` material boxes).
+    pub preview_lines: Vec<ScriptLine>,
+    /// HEAT3 geometry labels present that STEP cannot represent truthfully.
+    pub blockers: Vec<String>,
 }
 
 impl Default for Step3DPage {
@@ -32,6 +40,9 @@ impl Default for Step3DPage {
             lines: Vec::new(),
             active_view: None,
             material_colors: HashMap::new(),
+            mtl_source: None,
+            preview_lines: Vec::new(),
+            blockers: Vec::new(),
         }
     }
 }
@@ -43,11 +54,23 @@ impl Step3DPage {
             .iter()
             .filter(|line| line.label.as_deref() == Some("p") && line.segment.is_some())
             .count();
+        self.blockers = step_export_blockers(script);
+        // The STEP preview represents exactly what export writes: positive `p`
+        // material solids. Empty/BC/`s` geometry must not look exportable.
+        self.preview_lines = lines
+            .iter()
+            .filter(|line| line.label.as_deref() == Some("p") && line.segment.is_some())
+            .cloned()
+            .collect();
         self.lines = lines;
     }
 
     pub fn set_material_colors(&mut self, colors: HashMap<String, iced::Color>) {
         self.material_colors = colors;
+    }
+
+    pub fn set_mtl_source(&mut self, source: Option<String>) {
+        self.mtl_source = source;
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -67,6 +90,26 @@ impl Step3DPage {
                 theme::Status::Ok
             },
         ));
+        content = content.push(
+            text(match &self.mtl_source {
+                Some(name) => format!("Цвета материалов (MTL): {name}"),
+                None => "Цвета материалов (MTL): файл не загружен".to_owned(),
+            })
+            .size(theme::SMALL_SIZE),
+        );
+
+        if !self.blockers.is_empty() {
+            content = content.push(
+                text(format!(
+                    "Экспорт в STEP невозможен: модель содержит геометрию, которую нельзя представить как тела ({}). EPS-превью показывает только material-боксы `p`.",
+                    self.blockers.join(", ")
+                ))
+                .size(theme::BODY_SIZE)
+                .style(|theme| text::Style {
+                    color: Some(theme::status_color(theme::Status::Error, theme::is_dark(theme))),
+                }),
+            );
+        }
 
         if self.boxes == 0 {
             if let Some((message, error)) = &self.status {
@@ -75,7 +118,7 @@ impl Step3DPage {
             content = content.push(text("Нет данных для экспорта.").size(theme::BODY_SIZE));
             content = content.push(
                 Preview3D::view(
-                    &self.lines,
+                    &self.preview_lines,
                     &self.material_colors,
                     self.azimuth,
                     self.elevation,
@@ -112,7 +155,7 @@ impl Step3DPage {
             view_buttons = view_buttons.push(button_row);
         }
         let preview = Preview3D::view(
-            &self.lines,
+            &self.preview_lines,
             &self.material_colors,
             self.azimuth,
             self.elevation,
@@ -129,11 +172,15 @@ impl Step3DPage {
                 }
             }));
 
-        content = content.push(page_button(
+        content = content.push(page_button_maybe(
             "Экспорт в STEP",
             theme::Category::Secondary,
             true,
-            Message::StepExport,
+            if self.blockers.is_empty() {
+                Some(Message::StepExport)
+            } else {
+                None
+            },
         ));
         if let Some((message, error)) = &self.status {
             content = content.push(status_text(message, *error));
@@ -149,11 +196,14 @@ pub fn count_boxes(script: &str) -> usize {
         .count()
 }
 pub fn export_script(script: &str) -> Result<String, String> {
-    let boxes = parse_script(script)
-        .iter()
-        .filter(|line| line.label.as_deref() == Some("p"))
-        .filter_map(|line| line.segment.map(|segment| segment.as_tuple()))
-        .collect::<Vec<_>>();
+    let blockers = step_export_blockers(script);
+    if !blockers.is_empty() {
+        return Err(format!(
+            "Экспорт STEP невозможен: модель содержит геометрию, которую нельзя представить как тела ({}). Разбейте пустоты/BC-боксы или уберите неподдерживаемые команды.",
+            blockers.join(", ")
+        ));
+    }
+    let boxes = exportable_p_boxes(script);
     if boxes.is_empty() {
         return Err("Нет данных для экспорта.".to_owned());
     }

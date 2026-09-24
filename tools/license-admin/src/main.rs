@@ -73,6 +73,19 @@ fn status_of(response: &Value) -> Option<String> {
     string_at(response, "/data/attributes/status").map(str::to_owned)
 }
 
+/// Capture the compact license status before each mutation. A failed read
+/// cancels the operation so the audit journal can reconstruct the change.
+fn capture_before_and_mutate<T>(
+    id: &str,
+    get: impl FnOnce(&str) -> Result<Value, String>,
+    mutate: impl FnOnce() -> Result<T, String>,
+) -> Result<(String, Result<T, String>), String> {
+    let response = get(id)?;
+    let before =
+        status_of(&response).ok_or("Keygen did not return license status; mutation cancelled")?;
+    Ok((before, mutate()))
+}
+
 fn execute(client: &AdminClient, command: Command) -> (AuditOutcome, Result<(), String>) {
     let mut outcome = AuditOutcome::default();
     let result = (|| -> Result<(), String> {
@@ -89,43 +102,82 @@ fn execute(client: &AdminClient, command: Command) -> (AuditOutcome, Result<(), 
             Command::List { limit } => print_safe(client.list(limit)?)?,
             Command::Show { id } => print_safe(client.get(&id)?)?,
             Command::Suspend { id } => {
-                let response = client.action(&id, "suspend", Method::POST)?;
+                let (before, response) = capture_before_and_mutate(
+                    &id,
+                    |id| client.get(id),
+                    || client.action(&id, "suspend", Method::POST),
+                )?;
+                outcome.before_state = Some(before);
+                let response = response?;
                 outcome.license_id = Some(id.clone());
                 outcome.after_state = status_of(&response);
                 print_safe(response)?;
             }
             Command::Reinstate { id } => {
-                let response = client.action(&id, "reinstate", Method::POST)?;
+                let (before, response) = capture_before_and_mutate(
+                    &id,
+                    |id| client.get(id),
+                    || client.action(&id, "reinstate", Method::POST),
+                )?;
+                outcome.before_state = Some(before);
+                let response = response?;
                 outcome.license_id = Some(id.clone());
                 outcome.after_state = status_of(&response);
                 print_safe(response)?;
             }
             Command::Renew { id } => {
-                let response = client.action(&id, "renew", Method::POST)?;
+                let (before, response) = capture_before_and_mutate(
+                    &id,
+                    |id| client.get(id),
+                    || client.action(&id, "renew", Method::POST),
+                )?;
+                outcome.before_state = Some(before);
+                let response = response?;
                 outcome.license_id = Some(id.clone());
                 outcome.after_state = status_of(&response);
                 print_safe(response)?;
             }
             Command::ResetUsage { id, confirm } => {
                 require_confirmation(&id, &confirm)?;
-                let response = client.action(&id, "reset-usage", Method::POST)?;
+                let (before, response) = capture_before_and_mutate(
+                    &id,
+                    |id| client.get(id),
+                    || client.action(&id, "reset-usage", Method::POST),
+                )?;
+                outcome.before_state = Some(before);
+                let response = response?;
                 outcome.license_id = Some(id.clone());
                 outcome.after_state = Some("usage-reset".to_owned());
                 print_safe(response)?;
             }
             Command::ResetMachines { id, confirm } => {
                 require_confirmation(&id, &confirm)?;
-                let ids = client.list_all_machines(&id)?;
-                for machine_id in &ids {
-                    client.delete_machine(machine_id)?;
-                }
+                let (before, ids) = capture_before_and_mutate(
+                    &id,
+                    |id| client.get(id),
+                    || {
+                        let ids = client.list_all_machines(&id)?;
+                        for machine_id in &ids {
+                            client.delete_machine(machine_id)?;
+                        }
+                        Ok(ids)
+                    },
+                )?;
+                outcome.before_state = Some(before);
+                let ids = ids?;
                 outcome.license_id = Some(id.clone());
                 outcome.after_state = Some(format!("machines-deleted:{}", ids.len()));
                 println!("Удалено активаций: {}", ids.len());
             }
             Command::Revoke { id, confirm } => {
                 require_confirmation(&id, &confirm)?;
-                client.action(&id, "revoke", Method::DELETE)?;
+                let (before, result) = capture_before_and_mutate(
+                    &id,
+                    |id| client.get(id),
+                    || client.action(&id, "revoke", Method::DELETE).map(|_| ()),
+                )?;
+                outcome.before_state = Some(before);
+                result?;
                 outcome.license_id = Some(id.clone());
                 outcome.after_state = Some("revoked".to_owned());
                 println!("Лицензия {id} безвозвратно отозвана.");
@@ -897,15 +949,24 @@ fn persist_audit_state(path: &Path, state: &AuditState) -> Result<(), String> {
     atomic_write_bytes(path, &bytes)
 }
 
+/// Nanosecond timestamp plus a process-local counter: parallel writers in the
+/// same nanosecond must still get distinct temp file names on Windows.
+fn atomic_temp_suffix() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{}-{}", std::process::id(), nanos, counter)
+}
+
 fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
-        .ok_or_else(|| "Не удалось определить каталог audit state".to_owned())?;
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| "Не удалось подготовить временный audit state".to_owned())?
-        .as_nanos();
-    let temporary = parent.join(format!(".audit-state-{}-{unique}.tmp", std::process::id()));
+        .ok_or_else(|| "Не удалось определить родительский каталог audit state".to_owned())?;
+    let unique = atomic_temp_suffix();
+    let temporary = parent.join(format!(".audit-state-{unique}.tmp"));
     let result = (|| {
         let mut file = OpenOptions::new()
             .write(true)
@@ -992,7 +1053,7 @@ fn current_workstation() -> String {
         .collect()
 }
 
-fn entry_without_mac(entry: &AuditEntry) -> Result<Vec<u8>, String> {
+fn audit_payload(entry: &AuditEntry) -> Result<serde_json::Map<String, Value>, String> {
     // New contextual fields are inserted only when present so that entries
     // written by older tool versions keep verifying against their original
     // HMAC payload.
@@ -1019,7 +1080,11 @@ fn entry_without_mac(entry: &AuditEntry) -> Result<Vec<u8>, String> {
     if let Some(after_state) = &entry.after_state {
         payload.insert("after_state".to_owned(), json!(after_state));
     }
-    serde_json::to_vec(&Value::Object(payload))
+    Ok(payload)
+}
+
+fn entry_without_mac(entry: &AuditEntry) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&Value::Object(audit_payload(entry)?))
         .map_err(|_| "Не удалось вычислить audit MAC".to_owned())
 }
 
@@ -1307,6 +1372,48 @@ mod tests {
     }
 
     #[test]
+    fn mutations_are_blocked_when_before_state_cannot_be_captured() {
+        let mutated = std::cell::Cell::new(false);
+        let result = capture_before_and_mutate(
+            "license-1",
+            |_| Err("injected GET failure".to_owned()),
+            || {
+                mutated.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(
+            !mutated.get(),
+            "mutation must not run after a failed state read"
+        );
+
+        let result = capture_before_and_mutate(
+            "license-1",
+            |_| Ok(json!({"data": {"attributes": {}}})),
+            || {
+                mutated.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err(), "missing status must also fail closed");
+        assert!(!mutated.get());
+    }
+
+    #[test]
+    fn captured_before_state_is_retained_when_the_mutation_fails() {
+        let (before, mutation) = capture_before_and_mutate(
+            "license-1",
+            |_| Ok(json!({"data": {"attributes": {"status": "active"}}})),
+            || Err::<(), _>("injected action failure".to_owned()),
+        )
+        .unwrap();
+
+        assert_eq!(before, "active");
+        assert_eq!(mutation.unwrap_err(), "injected action failure");
+    }
+
+    #[test]
     fn consecutive_issue_operations_map_to_their_license_ids() {
         let path = env::temp_dir().join(format!(
             "heat3-admin-audit-issue-{}.jsonl",
@@ -1364,6 +1471,51 @@ mod tests {
             ]
         );
         assert!(entries.iter().all(|entry| !entry.workstation.is_empty()));
+        let _ = fs::remove_file(state_path);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn before_state_is_captured_and_hmac_covered() {
+        let path = env::temp_dir().join(format!(
+            "heat3-admin-audit-before-state-{}.jsonl",
+            std::process::id()
+        ));
+        let state_path = audit_state_path(&path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&state_path);
+        let key = b"01234567890123456789012345678901";
+        {
+            let mut log = AuditLog::open(path.clone(), key).unwrap();
+            let outcome = AuditOutcome {
+                license_id: Some("license-dd".to_owned()),
+                before_state: Some("active".to_owned()),
+                after_state: Some("suspended".to_owned()),
+            };
+            log.append(
+                "license.suspend",
+                "account",
+                "result",
+                Some(true),
+                "corr-s",
+                &outcome,
+            )
+            .unwrap();
+        }
+        let content = fs::read_to_string(&path).unwrap();
+        let entry: AuditEntry = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(entry.before_state.as_deref(), Some("active"));
+        assert_eq!(entry.after_state.as_deref(), Some("suspended"));
+        // The captured before/after values must be covered by the entry MAC:
+        // removing them from the payload must change the MAC.
+        let mut without_before = audit_payload(&entry).unwrap();
+        without_before.remove("before_state");
+        let mac_without_before = compute_mac(
+            key,
+            &serde_json::to_vec(&Value::Object(without_before)).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(&mac_without_before, &entry.mac);
         let _ = fs::remove_file(state_path);
         let _ = fs::remove_file(path);
     }

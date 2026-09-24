@@ -60,15 +60,32 @@ pub fn material_name_from_trailing(trailing: &str) -> String {
 
 fn material_name_text_from_trailing(trailing: &str) -> String {
     let t = trailing.trim();
-    if let Some(idx) = t.find('!') {
-        return t[..idx].trim().to_string();
-    }
-    for sep in [";", "//", "#"] {
-        if let Some(idx) = t.find(sep) {
-            return t[idx + sep.len()..].trim().to_string();
-        }
-    }
-    t.to_string()
+    let candidate = if let Some(idx) = t.find('!') {
+        t[..idx].trim()
+    } else if let Some(idx) = t.find(';') {
+        t[idx + 1..].trim()
+    } else if let Some(idx) = t.find("//") {
+        t[idx + 2..].trim()
+    } else if let Some(idx) = t.find('#') {
+        t[idx + 1..].trim()
+    } else {
+        t
+    };
+    strip_material_box_options(candidate)
+}
+
+/// Removes HEAT3 material-box option tokens (`%hide`, `%T=value`) from the
+/// trailing text so only the material name remains. The original trailing text
+/// is preserved untouched in the script line, so serialization/transforms keep
+/// the options intact; only name resolution strips them.
+fn strip_material_box_options(text: &str) -> String {
+    text.split_whitespace()
+        .filter(|token| {
+            let lower = token.to_ascii_lowercase();
+            lower != "%hide" && !lower.starts_with("%t=")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn split_line_ending(text: &str) -> (String, String) {
@@ -303,8 +320,17 @@ fn parse_mtl_record(data: &[u8], start: usize) -> Result<MtlMaterial, String> {
     let (rgb_r, rgb_g, rgb_b, _reserved, special_value) =
         (tail[0], tail[1], tail[2], tail[3], tail[4]);
 
+    let name = decode_text(&name_raw, NAME_ENCODING);
+    if name.trim().is_empty() {
+        // An empty/whitespace name is an integrity error rather than a record
+        // to silently drop: strict callers must fail, permissive callers skip.
+        return Err(format!(
+            "record at offset {start} has an empty material name"
+        ));
+    }
+
     Ok(MtlMaterial {
-        name: decode_text(&name_raw, NAME_ENCODING),
+        name,
         thermal_x: to_float(&tx_raw, "thermal_x")?,
         thermal_y: to_float(&ty_raw, "thermal_y")?,
         volume_heat: to_float(&vh_raw, "volume_heat")?,
@@ -339,10 +365,12 @@ pub fn parse_mtl_records(path: &Path, strict: bool) -> Result<Vec<MtlRecord>, St
 }
 
 pub fn parse_mtl_file(path: &Path, strict: bool) -> Result<Vec<MtlMaterial>, String> {
+    // No post-filter: empty-name records are already rejected by
+    // `parse_mtl_record` so strict loads fail loudly instead of dropping a
+    // record after a nominally successful parse.
     Ok(parse_mtl_records(path, strict)?
         .into_iter()
         .map(|r| r.material)
-        .filter(|m| !m.name.is_empty())
         .collect())
 }
 
@@ -465,15 +493,32 @@ pub fn write_mtl_file(path: &Path, materials: &[MtlMaterial]) -> Result<(), Stri
     atomic_write_bytes(path, &data)
 }
 
+/// Nanosecond timestamp plus a process-local counter: parallel writers in the
+/// same nanosecond must still get distinct temp file names on Windows.
+fn atomic_temp_suffix() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{}-{}", std::process::id(), nanos, counter)
+}
+
 pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomic_write_bytes_with_replace(path, bytes, atomic_replace)
+}
+
+fn atomic_write_bytes_with_replace(
+    path: &Path,
+    bytes: &[u8],
+    replace: impl FnOnce(&Path, &Path) -> Result<(), String>,
+) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "cannot write file: target path has no parent".to_owned())?;
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("cannot write file: {}", e))?
-        .as_nanos();
-    let temporary = parent.join(format!(".mtl-{}-{unique}.tmp", std::process::id()));
+    let unique = atomic_temp_suffix();
+    let temporary = parent.join(format!(".mtl-{unique}.tmp"));
 
     let result = (|| {
         let mut file = OpenOptions::new()
@@ -485,7 +530,7 @@ pub fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
             .map_err(|e| format!("cannot write file: {}", e))?;
         file.sync_all()
             .map_err(|e| format!("cannot write file: {}", e))?;
-        atomic_replace(&temporary, path)
+        replace(&temporary, path)
     })();
 
     if result.is_err() {
@@ -606,4 +651,41 @@ pub fn sort_material_names_by_conductivity(
         }
     });
     indexed.into_iter().map(|(_, n)| n.clone()).collect()
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::*;
+
+    #[test]
+    fn failed_atomic_replace_preserves_existing_destination_and_cleans_temp_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "heat3-atomic-write-failure-{}",
+            atomic_temp_suffix()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("export.stp");
+        fs::write(&path, b"previous valid export").unwrap();
+
+        let error =
+            atomic_write_bytes_with_replace(&path, b"new export", |temporary, destination| {
+                assert!(
+                    temporary.exists(),
+                    "complete replacement file is staged first"
+                );
+                assert_eq!(fs::read(temporary).unwrap(), b"new export");
+                assert_eq!(destination, path);
+                Err("injected atomic replace failure".to_owned())
+            })
+            .unwrap_err();
+
+        assert_eq!(error, "injected atomic replace failure");
+        assert_eq!(fs::read(&path).unwrap(), b"previous valid export");
+        let remaining = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec![path.file_name().unwrap()]);
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

@@ -8,7 +8,7 @@
 
 ## Быстрый старт
 
-Требуется установленный Rust toolchain (MSRV 1.88).
+Требуется установленный Rust toolchain (MSRV 1.90, см. `package.rust-version`).
 
 ```powershell
 cargo run --release

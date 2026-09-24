@@ -267,7 +267,12 @@ pub struct CornerPage {
     pub elevation: f64,
     pub active_view: Option<StandardView>,
     pub material_colors: HashMap<String, iced::Color>,
+    /// File name of the active MTL that supplies material colors, if any.
+    pub mtl_source: Option<String>,
     cached_script: String,
+    /// Stable source the generated variants derive from. It is the last shared
+    /// script explicitly synchronized from outside, never a generated result.
+    base_script: String,
     cached_pair: Option<crate::corner::ConstantPair>,
 }
 
@@ -283,7 +288,9 @@ impl Default for CornerPage {
             elevation: 25.0f64.to_radians(),
             active_view: None,
             material_colors: HashMap::new(),
+            mtl_source: None,
             cached_script: String::new(),
+            base_script: String::new(),
             cached_pair: None,
         }
     }
@@ -294,17 +301,42 @@ impl CornerPage {
         self.material_colors = colors;
     }
 
+    pub fn set_mtl_source(&mut self, source: Option<String>) {
+        self.mtl_source = source;
+    }
+
     pub fn clear_result(&mut self) {
         self.result = None;
         self.result_lines.clear();
     }
 
     pub fn sync_script(&mut self, script: &str) {
+        if self.cached_script == script {
+            return;
+        }
+        self.cached_script = script.to_owned();
+        self.base_script = script.to_owned();
         self.lines = crate::parser::parse_script(script);
-        if self.cached_script != script {
-            self.cached_script = script.to_owned();
-            self.cached_pair = crate::corner::detect_constant_pair(script);
-            self.clear_result();
+        self.cached_pair = crate::corner::detect_constant_pair(script);
+        // A generated variant only stays valid while the stable base is
+        // unchanged; any external script change invalidates it.
+        self.clear_result();
+    }
+
+    /// Stores a generated corner variant as page-local derived state. The
+    /// shared source is intentionally left untouched, so repeated generation
+    /// for different directions always derives from the same stable base.
+    pub fn set_result(&mut self, result: String) {
+        self.result_lines = crate::parser::parse_script(&result);
+        self.result = Some(result);
+    }
+
+    /// Stable base used for corner generation (excludes generated results).
+    pub fn base_script(&self) -> &str {
+        if self.base_script.is_empty() {
+            &self.cached_script
+        } else {
+            &self.base_script
         }
     }
 
@@ -336,6 +368,13 @@ impl CornerPage {
                 text(format!("Направление: {}", directions[self.direction])).size(theme::BODY_SIZE),
             );
             content = content.push(
+                text(match &self.mtl_source {
+                    Some(name) => format!("Цвета материалов (MTL): {name}"),
+                    None => "Цвета материалов (MTL): файл не загружен".to_owned(),
+                })
+                .size(theme::SMALL_SIZE),
+            );
+            content = content.push(
                 row![
                     super::widgets::square_button("←", Some(Message::CornerDirection(-1))),
                     super::widgets::square_button("→", Some(Message::CornerDirection(1)))
@@ -358,7 +397,7 @@ impl CornerPage {
             );
         }
         if let Some(result) = &self.result {
-            let before = crate::model_check::count_model_planes(&self.cached_script);
+            let before = crate::model_check::count_model_planes(self.base_script());
             let after = crate::model_check::count_model_planes(result);
             content = content.push(
                 text(format!(

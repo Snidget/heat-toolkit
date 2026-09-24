@@ -252,6 +252,52 @@ fn material(name: &str, thermal_x: f64) -> MtlMaterial {
 }
 
 #[test]
+fn test_material_box_options_are_not_part_of_the_material_name() {
+    let script = concat!(
+        "p 0 0 0 0.1 0.4 0.5 concrete, IEA %hide\n",
+        "p 0 0 0 0.1 0.4 0.5 concrete, IEA %T=10\n",
+        "p 0 0 0 0.1 0.4 0.5 concrete, IEA %hide %T=10\n",
+        "p 0 0 0 0.1 0.4 0.5 concrete, IEA %hide ! material box\n",
+        "p 0 0 0 0.1 0.4 0.5 concrete, IEA\n",
+    );
+    let entries = extract_material_entries(script);
+    assert_eq!(entries.len(), 1, "all option forms share one material");
+    assert_eq!(entries[0].name, "concrete, IEA");
+    assert_eq!(entries[0].count, 5);
+
+    // The original option text is preserved for serialization/transforms.
+    assert_eq!(
+        heat3_povorotnik::material_sort::material_name_from_trailing("concrete, IEA %hide"),
+        "concrete, iea"
+    );
+}
+
+#[test]
+fn test_strict_load_rejects_empty_material_name_instead_of_dropping_it() {
+    let path = std::env::temp_dir().join("test_materials_empty_name.mtl");
+    let valid = MtlMaterial {
+        name: "Valid".to_string(),
+        thermal_x: 0.15,
+        thermal_y: 0.15,
+        volume_heat: 0.0,
+        rgb_r: 1,
+        rgb_g: 2,
+        rgb_b: 3,
+        special_value: 0,
+    };
+    let mut empty = valid.clone();
+    empty.name = "   ".to_string();
+    write_mtl_file(&path, &[valid, empty]).unwrap();
+
+    let error = parse_mtl_file(&path, true).unwrap_err();
+    assert!(error.contains("empty material name"), "got: {error}");
+    // Permissive mode keeps the surviving valid record without failing.
+    assert_eq!(parse_mtl_file(&path, false).unwrap().len(), 1);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn test_material_index_rejects_conflicting_duplicate_names() {
     let conflicting = vec![material("Brick", 0.1), material("brick ", 0.2)];
     assert!(materials_by_normalized_name_checked(&conflicting).is_err());
