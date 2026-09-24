@@ -1,44 +1,17 @@
 name: Rust CI
 
+# This workflow owns the required status checks (rust-msrv, rust-client,
+# release-secret-scan, license-admin). It must therefore run for every push
+# and pull request: a skipped *workflow* leaves required checks Pending and
+# blocks merging, while individual expensive steps are made conditional below.
+# Do not add path/branch allowlists at the workflow level.
 on:
   push:
     branches: [main, master, develop]
     tags: ["v*"]
-    paths:
-      - ".github/workflows/rust.yml"
-      - "README.md"
-      - "docs/**"
-      - "src/**"
-      - "tests/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "assets/**"
-      - "resources/**"
-      - "scripts/**"
-      - "dist/**"
-      - "samples/**"
-      - "tools/check-source-hygiene.ps1"
-      - "tools/license-admin/**"
-      - "tools/release/**"
   workflow_dispatch:
   pull_request:
     branches: [main, master, develop]
-    paths:
-      - ".github/workflows/rust.yml"
-      - "README.md"
-      - "docs/**"
-      - "src/**"
-      - "tests/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "assets/**"
-      - "resources/**"
-      - "scripts/**"
-      - "dist/**"
-      - "samples/**"
-      - "tools/check-source-hygiene.ps1"
-      - "tools/license-admin/**"
-      - "tools/release/**"
 
 env:
   CARGO_TERM_COLOR: always
@@ -118,6 +91,31 @@ jobs:
         shell: pwsh
         run: .\scripts\audit-windows.ps1
 
+      - name: Validate release and E2E PowerShell scripts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $scripts = @(
+            "tools\release\sign-and-package.ps1",
+            "tools\check-source-hygiene.ps1",
+            "tools\e2e\staging-e2e.ps1"
+          )
+          foreach ($script in $scripts) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "$script:$($_.Extent.StartLineNumber): $($_.Message)" }
+              throw "PowerShell parse errors in $script"
+            }
+            Write-Output "Parsed OK: $script"
+          }
+
+      - name: Credential-free packaging smoke (Candle + Light)
+        shell: pwsh
+        run: .\tools\release\sign-and-package.ps1 -SmokeTest
+
   release-secret-scan:
     runs-on: windows-latest
     defaults:
@@ -172,9 +170,10 @@ jobs:
     defaults:
       run:
         working-directory: ${{ github.workspace }}
+    # Only public Keygen configuration is exposed here. The signing secrets are
+    # scoped to the single signing step below so checkout, toolchain, cache and
+    # cargo build / build scripts never run with the certificate present.
     env:
-      HEAT3_CODESIGN_CERT_BASE64: ${{ secrets.HEAT3_CODESIGN_CERT_BASE64 }}
-      HEAT3_CODESIGN_CERT_PASSWORD: ${{ secrets.HEAT3_CODESIGN_CERT_PASSWORD }}
       HEAT3_KEYGEN_API_URL: ${{ vars.HEAT3_KEYGEN_API_URL }}
       HEAT3_KEYGEN_ACCOUNT_ID: ${{ vars.HEAT3_KEYGEN_ACCOUNT_ID }}
       HEAT3_KEYGEN_PRODUCT_ID: ${{ vars.HEAT3_KEYGEN_PRODUCT_ID }}
@@ -183,6 +182,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
@@ -195,15 +196,24 @@ jobs:
       - name: Require release configuration
         shell: pwsh
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:HEAT3_CODESIGN_CERT_BASE64) -or [string]::IsNullOrWhiteSpace($env:HEAT3_CODESIGN_CERT_PASSWORD)) {
-            throw "Trusted release signing requires HEAT3_CODESIGN_CERT_BASE64 and HEAT3_CODESIGN_CERT_PASSWORD."
-          }
           $requiredKeygenVariables = "HEAT3_KEYGEN_API_URL", "HEAT3_KEYGEN_ACCOUNT_ID", "HEAT3_KEYGEN_PRODUCT_ID", "HEAT3_KEYGEN_POLICY_ID", "HEAT3_KEYGEN_PUBLIC_KEY"
           foreach ($variable in $requiredKeygenVariables) {
             if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($variable))) {
               throw "Trusted release build requires the GitHub variable $variable."
             }
           }
+
+      # A tag name alone is not a source trust boundary: only commits contained
+      # in the protected release branch may be signed.
+      - name: Verify the signed commit belongs to the protected release branch
+        shell: pwsh
+        run: |
+          git fetch origin main --no-tags --depth=1
+          git merge-base --is-ancestor "$env:GITHUB_SHA" origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "Commit $env:GITHUB_SHA is not contained in the protected release branch (origin/main); refusing to sign."
+          }
+          Write-Output "Containment check: $env:GITHUB_SHA is an ancestor of origin/main"
 
       - name: Enforce release version matches Cargo and tag
         shell: pwsh
@@ -231,7 +241,14 @@ jobs:
 
       - name: Sign and package the release
         shell: pwsh
-        run: .\tools\release\sign-and-package.ps1
+        env:
+          HEAT3_CODESIGN_CERT_BASE64: ${{ secrets.HEAT3_CODESIGN_CERT_BASE64 }}
+          HEAT3_CODESIGN_CERT_PASSWORD: ${{ secrets.HEAT3_CODESIGN_CERT_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:HEAT3_CODESIGN_CERT_BASE64) -or [string]::IsNullOrWhiteSpace($env:HEAT3_CODESIGN_CERT_PASSWORD)) {
+            throw "Trusted release signing requires HEAT3_CODESIGN_CERT_BASE64 and HEAT3_CODESIGN_CERT_PASSWORD."
+          }
+          .\tools\release\sign-and-package.ps1 -RequireMsi
 
       - name: Upload release package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

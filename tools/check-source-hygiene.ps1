@@ -30,6 +30,20 @@ if ($conflicts) {
     throw "Sync-conflict files found:$([Environment]::NewLine)$paths"
 }
 
+# Fail-closed guard for credential containers and private-key material. These
+# must never live in the repository, not even force-added past .gitignore.
+$credentialExtensions = @('.pfx', '.p12', '.pem', '.key', '.p8')
+$credentialFiles = @($files | Where-Object {
+        $name = $_.Name
+        $isEnvSecret = ($name -eq '.env' -or $name -like '.env.*') -and
+        $name -notlike '*.example' -and $name -notlike '*.sample'
+        $credentialExtensions -contains $_.Extension.ToLowerInvariant() -or $isEnvSecret
+    })
+if ($credentialFiles) {
+    $paths = ($credentialFiles.FullName | ForEach-Object { "  $_" }) -join [Environment]::NewLine
+    throw "Credential or private-key files must not be committed:$([Environment]::NewLine)$paths"
+}
+
 $sourceExtensions = @('.rs', '.toml', '.md', '.txt', '.yml', '.yaml', '.ps1', '.json', '.lock')
 $windows1251 = [Text.Encoding]::GetEncoding(1251)
 $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)

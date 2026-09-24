@@ -3,11 +3,17 @@
 //! Формирует корректный текстовый STEP-файл без внешних зависимостей.
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::Path;
 
+/// Deterministic full-precision real for STEP geometry. The shortest
+/// round-trip `f64` representation keeps thin features at large offsets from
+/// collapsing (unlike a fixed significant-digit formatter).
 fn fmt_r(value: f64) -> String {
-    crate::text::format_real(value)
+    let mut text = format!("{value}");
+    if !text.contains(['.', 'e', 'E']) {
+        text.push_str(".0");
+    }
+    text
 }
 
 /// HEAT3 stores model coordinates in metres; this STEP writer declares millimetres.
@@ -319,6 +325,32 @@ pub fn is_exportable_solid(box_: &[f64; 6]) -> bool {
         && (box_[5] - box_[2]).abs() > SOLID_EPSILON
 }
 
+/// HEAT3 geometry that cannot be represented as positive STEP material solids.
+///
+/// STEP export currently writes only positive `p` material boxes. Empty `e`
+/// cut-outs (subtractive), `s` material boxes (origin+extent) and unsupported
+/// geometric commands would silently produce physically false geometry, so
+/// their presence must fail the export instead of dropping them.
+pub fn step_export_blockers(script: &str) -> Vec<String> {
+    let (items, mut blockers) = crate::model_check::supported_geometry(script);
+    for item in &items {
+        if matches!(item.label, "e" | "s") && !blockers.iter().any(|b| b == item.label) {
+            blockers.push(item.label.to_owned());
+        }
+    }
+    blockers
+}
+
+/// Collects exactly the material boxes (`p`) that STEP export can write.
+pub fn exportable_p_boxes(script: &str) -> Vec<[f64; 6]> {
+    let (items, _) = crate::model_check::supported_geometry(script);
+    items
+        .into_iter()
+        .filter(|item| item.label == "p")
+        .map(|item| item.segment.as_tuple())
+        .collect()
+}
+
 pub fn write_step(path: &Path, boxes: &[[f64; 6]]) -> std::io::Result<StepExportSummary> {
     let exportable_boxes: Vec<[f64; 6]> =
         boxes.iter().copied().filter(is_exportable_solid).collect();
@@ -431,7 +463,11 @@ pub fn write_step(path: &Path, boxes: &[[f64; 6]]) -> std::io::Result<StepExport
     out.push_str(&footer.join("\n"));
     out.push('\n');
 
-    fs::write(path, out)?;
+    // Atomic replacement: write to a temp file in the destination directory,
+    // flush, then replace the destination only on success so a truncate/partial
+    // write cannot destroy an existing valid export.
+    crate::material_sort::atomic_write_bytes(path, out.as_bytes())
+        .map_err(std::io::Error::other)?;
     Ok(summary)
 }
 
@@ -439,6 +475,7 @@ pub fn write_step(path: &Path, boxes: &[[f64; 6]]) -> std::io::Result<StepExport
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn entity_map(lines: &[String]) -> HashMap<String, String> {
@@ -535,6 +572,57 @@ mod tests {
             box_in_step_millimetres([0.0, 0.0, 0.0, 1.0, 0.5, 0.1]),
             [0.0, 0.0, 0.0, 1000.0, 500.0, 100.0]
         );
+    }
+
+    #[test]
+    fn step_export_fails_closed_on_empty_and_s_material_geometry() {
+        // `p` + `e` cut-out: the empty box cannot be represented as a solid, so
+        // exporting only `p` would be physically false.
+        assert_eq!(
+            step_export_blockers("p 0 0 0 3 3 3 Material\ne 1 1 1 2 2 2"),
+            vec!["e".to_owned()]
+        );
+        // Official `s` material box is unsupported material geometry.
+        assert_eq!(
+            step_export_blockers("p 0 0 0 1 1 1 A\ns 0 0 0 1 1 1 B"),
+            vec!["s".to_owned()]
+        );
+        // A pure `p` model is exportable.
+        assert!(step_export_blockers("p 0 0 0 1 1 1 A\nb 0 0 0 1 1 1 2").is_empty());
+        assert_eq!(exportable_p_boxes("p 0 0 0 1 2 3 A").len(), 1);
+    }
+
+    #[test]
+    fn failed_export_preserves_an_existing_destination_file() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("heat3-step-atomic-{unique}.stp"));
+        std::fs::write(&path, b"previous valid export").unwrap();
+
+        // All-degenerate input fails before writing anything.
+        let error = write_step(&path, &[[0.0, 0.0, 0.0, 0.0, 1.0, 1.0]]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous valid export");
+
+        // A successful export atomically replaces it.
+        write_step(&path, &[[0.0, 0.0, 0.0, 1.0, 2.0, 3.0]]).unwrap();
+        let output = std::fs::read_to_string(&path).unwrap();
+        assert!(output.contains("ISO-10303-21;"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn step_real_formatting_preserves_thin_features_at_large_offsets() {
+        // A 0.0001 m feature offset by 1000 m becomes 0.1 mm at 1_000_000 mm.
+        // A six-significant-digit formatter would collapse these coordinates.
+        let offset_mm = 1000.0 * METRES_TO_MILLIMETRES;
+        let thin_mm = (1000.0 + 0.0001) * METRES_TO_MILLIMETRES;
+        assert_eq!(fmt_r(offset_mm), "1000000.0");
+        assert_eq!(fmt_r(thin_mm), "1000000.1");
+        assert_ne!(fmt_r(offset_mm), fmt_r(thin_mm));
     }
 
     #[test]

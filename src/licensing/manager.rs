@@ -86,6 +86,13 @@ impl LicenseManager {
         manager
     }
 
+    /// Test-only permissive manager so UI state-transition tests can exercise
+    /// licensed message handling without a real Keygen configuration.
+    #[cfg(test)]
+    pub(crate) fn development_for_tests() -> Self {
+        Self::development()
+    }
+
     #[cfg(debug_assertions)]
     fn development() -> Self {
         let now = unix_now().unwrap_or(0);
@@ -311,15 +318,14 @@ impl LicenseManager {
             return;
         }
         let now = unix_now().unwrap_or(i64::MIN);
-        let reconciled =
-            match store.update(|current| reconcile_restored_record(current, &record, now)) {
-                Ok(record) => record,
-                Err(_) => {
-                    self.message = "Failed to safely update the local license record.".to_owned();
-                    self.gate.transition_to(LicenseState::Tampered);
-                    return;
-                }
-            };
+        let reconciled = match store.update(|current| reconcile_restored_record(current, &record)) {
+            Ok(record) => record,
+            Err(_) => {
+                self.message = "Failed to safely update the local license record.".to_owned();
+                self.gate.transition_to(LicenseState::Tampered);
+                return;
+            }
+        };
         self.masked_key = Some(mask_license_key(reconciled.license_key()));
         self.gate
             .restore_trusted_time(reconciled.max_observed_trusted_time());
@@ -529,17 +535,31 @@ fn activate_worker(config: KeygenConfig, store: SecureStore, mut key: String) ->
             Err(_) => Err(WorkerFailure::Storage),
         }
     })();
+    let mut rollback_failed = false;
     if result.is_err() {
         if let Some(machine_id) = &created_machine {
             // Compensating cleanup: the activation never committed locally, so
-            // the server-side machine must not linger and consume a slot.
-            let _ = client.deactivate_machine(&key, machine_id);
+            // the server-side machine must not linger and consume a slot. A
+            // failed rollback must be surfaced, not silently swallowed.
+            if client.deactivate_machine(&key, machine_id).is_err() {
+                rollback_failed = true;
+            }
         }
     }
     key.zeroize();
-    match result {
+    let mut worker_result = match result {
         Ok(worker_result) => worker_result,
         Err(error) => failure_result(error, Some(masked)),
+    };
+    append_rollback_warning(&mut worker_result.message, rollback_failed);
+    worker_result
+}
+
+fn append_rollback_warning(message: &mut String, rollback_failed: bool) {
+    if rollback_failed {
+        message.push_str(
+            " Внимание: не удалось отменить серверную активацию — слот машины может остаться занятым.",
+        );
     }
 }
 
@@ -908,7 +928,6 @@ fn replace_record_if_unchanged(
 fn reconcile_restored_record(
     current: Option<SecureLicenseRecord>,
     original: &SecureLicenseRecord,
-    now: i64,
 ) -> Result<(Option<SecureLicenseRecord>, SecureLicenseRecord), super::StorageError> {
     let Some(mut current) = current else {
         return Err(super::StorageError::InvalidRecord);
@@ -917,7 +936,9 @@ fn reconcile_restored_record(
         let preserved = current.clone();
         return Ok((Some(current), preserved));
     }
-    current.observe_time(now);
+    // Never persist the untrusted local clock as the trusted-time floor: a
+    // far-future (or rolled-back) local clock must not poison recovery. The
+    // floor is only advanced by signed server time or an allowed transition.
     current.set_authoritative_block(None);
     current.set_deactivation_pending(false);
     let persisted = current.clone();
@@ -1459,6 +1480,43 @@ mod tests {
             status: 503,
             code: None,
         }));
+    }
+
+    #[test]
+    fn restore_reconcile_does_not_persist_untrusted_local_time() {
+        let record = SecureLicenseRecord::new(
+            "key",
+            "license-id",
+            "machine-id",
+            "fingerprint",
+            HARDWARE_SCHEMA_VERSION,
+            vec![HardwareComponent {
+                kind: HardwareComponentKind::SystemUuid,
+                digest: "a".repeat(64),
+            }],
+            vec![1, 2, 3],
+            100,
+            100,
+            1_000,
+        )
+        .unwrap();
+
+        let (_, reconciled) = reconcile_restored_record(Some(record.clone()), &record).unwrap();
+
+        // The local clock is never observed as a trusted floor here, so an
+        // accidentally far-future clock cannot poison recovery.
+        assert_eq!(reconciled.max_observed_trusted_time(), 100);
+    }
+
+    #[test]
+    fn rollback_failure_is_surfaced_in_the_activation_message() {
+        let mut message = "Activation failed.".to_owned();
+        append_rollback_warning(&mut message, true);
+        assert!(message.contains("не удалось отменить серверную активацию"));
+
+        let mut clean = "Activation failed.".to_owned();
+        append_rollback_warning(&mut clean, false);
+        assert_eq!(clean, "Activation failed.");
     }
 
     #[test]

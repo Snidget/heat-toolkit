@@ -25,6 +25,7 @@ use std::process::ExitCode;
 use heat3_povorotnik::licensing::{collect_hardware_identity, HardwareIdentity};
 use heat3_povorotnik::licensing::{
     KeygenClient, KeygenClientError, KeygenConfig, MachineCertificateVerifier, MachineFileContext,
+    ValidationCode,
 };
 
 fn env_var(name: &str) -> Result<String, String> {
@@ -156,29 +157,41 @@ fn cmd_activate(
     license_key: String,
     cert_out: String,
 ) -> Result<u8, String> {
+    // Mirror production activation semantics: a strict node-locked policy
+    // answers the first validation for a legitimate, not-yet-activated license
+    // with NO_MACHINE. Find-before-create keeps activation idempotent, then a
+    // final revalidation must be VALID.
     let validation = client
         .validate_key(&license_key, hardware)
         .map_err(|error| format!("validate_key failed: {error}"))?;
-    if !validation.valid {
-        return Err(format!("license is not valid: {:?}", validation.code));
+    if !matches!(
+        validation.code,
+        ValidationCode::Valid | ValidationCode::NoMachine
+    ) {
+        return Err(format!(
+            "license is not in an activatable state: {:?}",
+            validation.code
+        ));
     }
     let license_id = validation
         .license_id
         .ok_or_else(|| "server returned no license_id".to_owned())?;
-    let first = client
-        .activate_machine(&license_key, &license_id, hardware, "E2E-Staging-Harness")
-        .map_err(|error| format!("activate_machine failed: {error}"))?;
-    let duplicate = client
-        .activate_machine(&license_key, &license_id, hardware, "E2E-Staging-Harness")
-        .map_err(|error| format!("duplicate activate_machine failed: {error}"))?;
-    let found = client
+    let machine = match client
         .find_machine(&license_key, &license_id, &hardware.fingerprint)
-        .map_err(|error| format!("find_machine failed: {error}"))?;
-    let machine = found.ok_or_else(|| "find_machine returned no machine".to_owned())?;
-    if machine.machine_id != first.machine_id || machine.machine_id != duplicate.machine_id {
+        .map_err(|error| format!("find_machine failed: {error}"))?
+    {
+        Some(machine) => machine,
+        None => client
+            .activate_machine(&license_key, &license_id, hardware, "E2E-Staging-Harness")
+            .map_err(|error| format!("activate_machine failed: {error}"))?,
+    };
+    let revalidation = client
+        .validate_key(&license_key, hardware)
+        .map_err(|error| format!("revalidate_key failed: {error}"))?;
+    if !revalidation.valid {
         return Err(format!(
-            "machine deduplication failed: activate1={} activate2={} found={}",
-            first.machine_id, duplicate.machine_id, machine.machine_id
+            "license is not valid after machine creation: {:?}",
+            revalidation.code
         ));
     }
     let checkout = client

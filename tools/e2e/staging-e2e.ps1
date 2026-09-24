@@ -72,7 +72,9 @@ function Invoke-Admin {
 }
 
 function Add-Result {
-    param([int]$Id, [string]$Name, [string]$Status, [string]$Note)
+    # IDs are strings so automated sub-checks can use unique identifiers
+    # (e.g. "3b") instead of emitting two rows with the same scenario ID.
+    param([string]$Id, [string]$Name, [string]$Status, [string]$Note)
     $script:results.Add([PSCustomObject]@{
         Id = $Id; Name = $Name; Status = $Status; Note = $Note
     })
@@ -90,6 +92,11 @@ function Write-Report {
     $passed = @($script:results | Where-Object { $_.Status -eq "PASS" }).Count
     $failed = @($script:results | Where-Object { $_.Status -eq "FAIL" }).Count
     $manual = @($script:results | Where-Object { $_.Status -eq "MANUAL" }).Count
+    $duplicates = @($script:results | Group-Object Id | Where-Object { $_.Count -gt 1 })
+    if ($duplicates) {
+        $ids = ($duplicates | ForEach-Object { $_.Name }) -join ", "
+        throw "Duplicate scenario IDs in one run: $ids"
+    }
     $lines.Add("## Summary: PASS=$passed FAIL=$failed MANUAL=$manual")
     $lines.Add("")
     $lines.Add("| # | Scenario | Status | Notes |")
@@ -142,25 +149,37 @@ try {
     }
     Write-Host "license_id=$licenseId"
 
+    # A strict node-locked policy answers the first validation of a legitimate,
+    # not-yet-activated license with NO_MACHINE; the activate probe below must
+    # handle that documented pre-activation state.
     $r1 = Invoke-Probe @("validate", $licenseKey)
     if ($r1.Code -eq 0) {
-        Add-Result 1 "Valid new key, network available: one machine created, functions open" "PASS" "validate exit 0"
+        Add-Result 1 "Valid new key, network available: one machine created, functions open" "PASS" "validate exit 0 (already valid)"
+    } elseif ($r1.Code -eq 2 -and $r1.Text -match 'code=NoMachine') {
+        Add-Result 1 "Valid new key, network available: one machine created, functions open" "PASS" "strict node-locked pre-activation state NoMachine observed"
     } else {
-        Add-Result 1 "Valid new key, network available" "FAIL" "validate exit $($r1.Code)"
+        Add-Result 1 "Valid new key, network available" "FAIL" "validate exit $($r1.Code) output: $($r1.Text)"
     }
 
     $certPath = Join-Path $env:TEMP ("heat3-e2e-" + [guid]::NewGuid().ToString("N") + ".cert")
-    $r2 = Invoke-Probe @("activate", $licenseKey, $certPath)
-    if ($r2.Code -eq 0 -and $r2.Text -match 'machine_id=(\S+)') {
+    $r2a = Invoke-Probe @("activate", $licenseKey, $certPath)
+    $r2b = $null
+    if ($r2a.Code -eq 0 -and $r2a.Text -match 'machine_id=(\S+)') {
         $machineId = $Matches[1]
-        Add-Result 2 "Rerun on the same PC: duplicate machine is not created" "PASS" "activate idempotent, machine_id=$machineId"
+        # Rerun on the same PC: find-before-create must return the same machine.
+        $r2b = Invoke-Probe @("activate", $licenseKey, $certPath)
+        if ($r2b.Code -eq 0 -and $r2b.Text -match 'machine_id=(\S+)' -and $Matches[1] -eq $machineId) {
+            Add-Result 2 "Rerun on the same PC: duplicate machine is not created" "PASS" "find-before-create idempotent, machine_id=$machineId"
+        } else {
+            Add-Result 2 "Rerun on the same PC: duplicate machine is not created" "FAIL" "second activate exit $($r2b.Code) output: $($r2b.Text)"
+        }
     } else {
-        Add-Result 2 "Rerun on the same PC: duplicate machine is not created" "FAIL" "activate exit $($r2.Code)"
+        Add-Result 2 "Rerun on the same PC: duplicate machine is not created" "FAIL" "activate exit $($r2a.Code) output: $($r2a.Text)"
     }
 
     $r3 = Invoke-Probe @("checkin", $licenseKey, $licenseId)
     if ($r3.Code -eq 0) {
-        Add-Result 3 "No network for a day, TTL still valid (check-in path)" "PASS" "checkin ok; offline UI part is MANUAL below"
+        Add-Result 3 "No network for a day, TTL still valid (check-in path)" "PASS" "checkin ok"
     } else {
         Add-Result 3 "No network for a day, TTL still valid" "FAIL" "checkin exit $($r3.Code)"
     }
@@ -223,10 +242,13 @@ try {
         $env:HEAT3_E2E_API_URL = "https://127.0.0.1:9/"
         $r12 = Invoke-Probe @("expect-network-failure", $licenseKey, $licenseId, $machineId)
         if ($r12.Code -eq 0) {
-            Add-Result 13 "Keygen 5xx/timeout with valid lease: old TTL kept" "PASS" "transport failure mapped to Timeout/Connection/Transport"
+            # The probe classifies the transport failure only; the lease
+            # retention state machine is a distinct MANUAL scenario below.
+            Add-Result 13 "Keygen 5xx/timeout classified as transient outage" "PASS" "transport failure mapped to Timeout/Connection/Transport/5xx"
         } else {
-            Add-Result 13 "Keygen 5xx/timeout with valid lease: old TTL kept" "FAIL" "expect-network-failure exit $($r12.Code)"
+            Add-Result 13 "Keygen 5xx/timeout classified as transient outage" "FAIL" "expect-network-failure exit $($r12.Code)"
         }
+        Add-Result "13b" "Keygen 5xx/timeout with valid lease: old TTL kept" "MANUAL" "requires manager/state-machine run: pre-existing signed lease, outage, access kept until the old expiry"
         Add-Result 14 "Keygen 5xx/timeout without lease: fail closed" "MANUAL" "requires a genuine no-cached-lease UI/state-machine run"
     }
     finally {
@@ -270,7 +292,7 @@ try {
 
     Add-Result 19 "Production backup restored on staging validates" "MANUAL" "docker volume backup/restore drill on the Keygen CE instance"
     Add-Result 20 "Window move/resize during refresh: no freezes" "MANUAL" "GUI: drag window while license refresh runs"
-    Add-Result 3 "No network for a day, TTL still valid (offline UI part)" "MANUAL" "GUI: run offline before TTL expires"
+    Add-Result "3b" "No network for a day, TTL still valid (offline UI part)" "MANUAL" "GUI: run offline before TTL expires"
 }
 finally {
     if ($suspended) {

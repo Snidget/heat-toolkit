@@ -397,19 +397,28 @@ impl KeygenClient {
         let date = header(&response, DATE.as_str())?;
         let digest = header(&response, "digest")?;
         let signature = header(&response, "keygen-signature")?;
+        // A transient 429/5xx status must survive the pre-parse body pipeline:
+        // an oversized/truncated/read-failing outage body is still the same
+        // service outage, not a generic response-size or transport failure.
         if response
             .content_length()
             .is_some_and(|length| length > MAX_RESPONSE_SIZE as u64)
         {
-            return Err(KeygenClientError::ResponseTooLarge);
+            return Err(preserve_transient_status(
+                status,
+                KeygenClientError::ResponseTooLarge,
+            ));
         }
         let mut body = Vec::new();
         response
             .take(MAX_RESPONSE_SIZE as u64 + 1)
             .read_to_end(&mut body)
-            .map_err(|_| KeygenClientError::Transport)?;
+            .map_err(|_| preserve_transient_status(status, KeygenClientError::Transport))?;
         if body.len() > MAX_RESPONSE_SIZE {
-            return Err(KeygenClientError::ResponseTooLarge);
+            return Err(preserve_transient_status(
+                status,
+                KeygenClientError::ResponseTooLarge,
+            ));
         }
 
         let path_and_query = match url.query() {
@@ -667,6 +676,20 @@ fn is_transient_status(status: StatusCode) -> bool {
     status.as_u16() == 429 || status.is_server_error()
 }
 
+/// Classifies a pre-parse body-pipeline failure. A transient 429/5xx status is
+/// preserved as a service-outage classification so a still-valid offline lease
+/// is not dropped just because the outage body was oversized or unreadable.
+fn preserve_transient_status(status: StatusCode, fallback: KeygenClientError) -> KeygenClientError {
+    if is_transient_status(status) {
+        KeygenClientError::Api {
+            status: status.as_u16(),
+            code: None,
+        }
+    } else {
+        fallback
+    }
+}
+
 fn parse_api_error(status: StatusCode, body: &[u8]) -> KeygenClientError {
     let code = serde_json::from_slice::<Value>(body)
         .ok()
@@ -802,6 +825,32 @@ mod tests {
             }],
             strength: HardwareIdentityStrength::Weak,
         }
+    }
+
+    #[test]
+    fn transient_status_is_preserved_through_the_body_pipeline() {
+        use reqwest::StatusCode as S;
+        // A signed/enveloped 429/5xx with oversized or unreadable body keeps
+        // the outage classification instead of a generic size/transport error.
+        assert_eq!(
+            preserve_transient_status(S::SERVICE_UNAVAILABLE, KeygenClientError::ResponseTooLarge),
+            KeygenClientError::Api {
+                status: 503,
+                code: None,
+            }
+        );
+        assert_eq!(
+            preserve_transient_status(S::TOO_MANY_REQUESTS, KeygenClientError::Transport),
+            KeygenClientError::Api {
+                status: 429,
+                code: None,
+            }
+        );
+        // A non-transient status keeps its specific pipeline error.
+        assert_eq!(
+            preserve_transient_status(S::BAD_REQUEST, KeygenClientError::Transport),
+            KeygenClientError::Transport
+        );
     }
 
     #[test]
