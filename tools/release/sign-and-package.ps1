@@ -131,11 +131,17 @@ function Assert-SmokePayload {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][byte[]]$ExpectedBytes,
-        [Parameter(Mandatory = $true)][string]$StepName
+        [Parameter(Mandatory = $true)][string]$StepName,
+        [Parameter(Mandatory = $true)][string]$LogPath
     )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        throw "MSI smoke step '$StepName' did not install $Path."
+        $logTail = if (Test-Path -LiteralPath $LogPath) {
+            (Get-Content -LiteralPath $LogPath -Tail 100) -join [Environment]::NewLine
+        } else {
+            "No Windows Installer log was produced at $LogPath."
+        }
+        throw "MSI smoke step '$StepName' did not install $Path.`nMSI log tail:`n$logTail"
     }
     $actualBytes = [IO.File]::ReadAllBytes($Path)
     if ([Convert]::ToBase64String($actualBytes) -ne [Convert]::ToBase64String($ExpectedBytes)) {
@@ -199,7 +205,7 @@ if ($SmokeTest) {
         $installer = New-Object -ComObject WindowsInstaller.Installer
         Invoke-MsiSmokeStep -MsiArguments @("/i", $msiV1) -StepName "install-v1" -LogDirectory $smokeDir
         Assert-SmokePayload -Path (Join-Path $smokeInstallDirectory "heat3_povorotnik.exe") `
-            -ExpectedBytes $payloadV1 -StepName "install-v1"
+            -ExpectedBytes $payloadV1 -StepName "install-v1" -LogPath (Join-Path $smokeDir "install-v1.log")
         $v1ProductCodes = @(Get-RelatedProductCodes -Installer $installer -UpgradeCode $smokeUpgradeCode)
         if ($v1ProductCodes.Count -ne 1) {
             throw "MSI lifecycle smoke expected one installed v1 product, found $($v1ProductCodes.Count)."
@@ -212,7 +218,7 @@ if ($SmokeTest) {
 
         Invoke-MsiSmokeStep -MsiArguments @("/i", $msiV2) -StepName "upgrade-v2" -LogDirectory $smokeDir
         Assert-SmokePayload -Path (Join-Path $smokeInstallDirectory "heat3_povorotnik.exe") `
-            -ExpectedBytes $payloadV2 -StepName "upgrade-v2"
+            -ExpectedBytes $payloadV2 -StepName "upgrade-v2" -LogPath (Join-Path $smokeDir "upgrade-v2.log")
         $v2ProductCodes = @(Get-RelatedProductCodes -Installer $installer -UpgradeCode $smokeUpgradeCode)
         if ($v2ProductCodes.Count -ne 1) {
             throw "MSI major upgrade left $($v2ProductCodes.Count) related products installed; expected exactly one."
