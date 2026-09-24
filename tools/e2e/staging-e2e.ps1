@@ -179,9 +179,9 @@ try {
 
     $r3 = Invoke-Probe @("checkin", $licenseKey, $licenseId)
     if ($r3.Code -eq 0) {
-        Add-Result 3 "No network for a day, TTL still valid (check-in path)" "PASS" "checkin ok"
+        Add-Result 3 "Online Keygen check-in succeeds" "PASS" "checkin ok"
     } else {
-        Add-Result 3 "No network for a day, TTL still valid" "FAIL" "checkin exit $($r3.Code)"
+        Add-Result 3 "Online Keygen check-in succeeds" "FAIL" "checkin exit $($r3.Code)"
     }
     Add-Result 4 "No network after TTL: NeedsOnline, functions closed" "MANUAL" "GUI: unplug network > TTL, relaunch app"
 

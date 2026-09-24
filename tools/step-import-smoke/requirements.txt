@@ -1,0 +1,6 @@
+# OCP uses VTK on Windows for its native library paths; the smoke does not need
+# VTK's optional plotting stack, so CI installs only these pinned wheels.
+cadquery-ocp==7.8.1.1 \
+    --hash=sha256:5ab44107b70cb60402d797571b31c549666c46f8e20c210712a5cbe4ff7359ff
+vtk==9.3.1 \
+    --hash=sha256:685988e09070e06c8605886591698fd42d8225489509b6537a5046cd034cc93e
