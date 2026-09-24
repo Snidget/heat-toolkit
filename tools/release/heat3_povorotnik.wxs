@@ -13,7 +13,7 @@
       <Directory Id="ProgramFiles64Folder">
         <Directory Id="INSTALLFOLDER" Name="$(var.Heat3InstallDirectoryName)">
           <Component Id="ApplicationFiles" Guid="*" Win64="yes">
-            <File Id="heat3_exe" Source="$(var.Heat3Exe)" KeyPath="yes" />
+            <File Id="heat3_exe" Source="$(var.Heat3Exe)" Name="heat3_povorotnik.exe" KeyPath="yes" />
           </Component>
         </Directory>
       </Directory>
