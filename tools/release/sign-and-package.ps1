@@ -101,7 +101,9 @@ function Invoke-MsiSmokeStep {
 
     $logPath = Join-Path $LogDirectory "$StepName.log"
     $arguments = @($MsiArguments) + @("/qn", "/norestart", "/L*v", $logPath)
-    $quotedArguments = $arguments | ForEach-Object { '"' + $_.Replace('"', '\"') + '"' }
+    $quotedArguments = $arguments | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + $_.Replace('"', '\"') + '"' } else { $_ }
+    }
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = "$env:SystemRoot\System32\msiexec.exe"
     $startInfo.Arguments = $quotedArguments -join ' '
@@ -112,7 +114,12 @@ function Invoke-MsiSmokeStep {
         if (-not $process.WaitForExit(180000)) {
             $process.Kill()
             $process.WaitForExit()
-            throw "MSI smoke step '$StepName' exceeded the 180-second timeout."
+            $logTail = if (Test-Path -LiteralPath $logPath) {
+                (Get-Content -LiteralPath $logPath -Tail 50) -join [Environment]::NewLine
+            } else {
+                "No Windows Installer log was produced at $logPath."
+            }
+            throw "MSI smoke step '$StepName' exceeded the 180-second timeout.`n$logTail"
         }
         $exitCode = $process.ExitCode
     } finally {
