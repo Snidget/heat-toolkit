@@ -77,7 +77,10 @@ fn status_of(response: &Value) -> Option<String> {
 /// the audit journal can reconstruct what a state-changing command changed from.
 /// A failed read leaves the field empty rather than failing the operation.
 fn capture_state(client: &AdminClient, id: &str) -> Option<String> {
-    client.get(id).ok().and_then(|response| status_of(&response))
+    client
+        .get(id)
+        .ok()
+        .and_then(|response| status_of(&response))
 }
 
 fn execute(client: &AdminClient, command: Command) -> (AuditOutcome, Result<(), String>) {

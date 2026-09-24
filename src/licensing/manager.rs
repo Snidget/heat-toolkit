@@ -93,7 +93,10 @@ impl LicenseManager {
         Self::development()
     }
 
-    #[cfg(debug_assertions)]
+    // Available in debug builds for the opt-in `HEAT3_DEV_LICENSE` bypass and
+    // in every test profile (including `cargo test --release`) for the
+    // test-only constructor above.
+    #[cfg(any(debug_assertions, test))]
     fn development() -> Self {
         let now = unix_now().unwrap_or(0);
         let lease = LicenseLease::new(
